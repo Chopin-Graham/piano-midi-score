@@ -1,3 +1,4 @@
+import json
 import subprocess
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -364,8 +365,6 @@ def test_sustained_extreme_quarter_octave_uses_short_ottava() -> None:
         int(value.text or "0")
         for value in root.findall(".//note/pitch/octave")
     ]
-    # MusicXML keeps sounding pitch. MuseScore derives the one-octave-lower
-    # written position from the 8va line; shifting both would double-count it.
     assert sounding_octaves == [5, 6]
     assert root.find(".//octave-shift").get("type") == "down"
 
@@ -462,22 +461,25 @@ def test_musescore_ottava_round_trip_preserves_sounding_pitch(
         for index, pitch in enumerate(pitches, start=1)
     ]
     musicxml_path = tmp_path / "ottava.musicxml"
-    score_path = tmp_path / "ottava.mscz"
     midi_path = tmp_path / "ottava.mid"
+    job_path = tmp_path / "musescore-job.json"
     musicxml_path.write_text(score_to_musicxml(_score(notes)), encoding="utf-8")
+    job_path.write_text(
+        json.dumps([{"in": str(musicxml_path), "out": [str(midi_path)]}]),
+        encoding="utf-8",
+    )
 
-    for source, target in ((musicxml_path, score_path), (score_path, midi_path)):
-        completed = subprocess.run(
-            [str(executable), "-o", str(target), str(source)],
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=60,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        assert completed.returncode == 0, completed.stderr or completed.stdout
+    completed = subprocess.run(
+        [str(executable), "-j", str(job_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
     exported_pitches = sorted(
         {
@@ -488,6 +490,89 @@ def test_musescore_ottava_round_trip_preserves_sounding_pitch(
         }
     )
     assert exported_pitches == sorted(pitches)
+
+
+def test_overlapping_staff_ottavas_use_distinct_numbers_and_preserve_pitch(
+    tmp_path: Path,
+) -> None:
+    executable = find_musescore()
+    if executable is None:
+        pytest.skip("MuseScore is not installed")
+
+    high = (84, 88, 92, 88, 84, 88)
+    low = (36, 32, 28, 24, 28, 32)
+    notes = [
+        QuantizedNote(
+            index + 1,
+            pitch,
+            index * 240,
+            240,
+            80,
+            0,
+            0,
+            Staff.RIGHT,
+            hand=Hand.RIGHT,
+        )
+        for index, pitch in enumerate(high)
+    ]
+    notes.extend(
+        QuantizedNote(
+            len(high) + index + 1,
+            pitch,
+            index * 240,
+            240,
+            80,
+            0,
+            0,
+            Staff.LEFT,
+            hand=Hand.LEFT,
+        )
+        for index, pitch in enumerate(low)
+    )
+
+    musicxml = score_to_musicxml(_score(notes))
+    root = ET.fromstring(musicxml)
+    numbered_shifts = {
+        (
+            direction.findtext("staff"),
+            shift.get("type"),
+            shift.get("number"),
+        )
+        for direction in root.findall(".//direction")
+        if (shift := direction.find("direction-type/octave-shift")) is not None
+    }
+    assert ("1", "down", "1") in numbered_shifts
+    assert ("1", "stop", "1") in numbered_shifts
+    assert ("2", "up", "2") in numbered_shifts
+    assert ("2", "stop", "2") in numbered_shifts
+
+    musicxml_path = tmp_path / "overlapping-ottavas.musicxml"
+    midi_path = tmp_path / "overlapping-ottavas.mid"
+    job_path = tmp_path / "musescore-job.json"
+    musicxml_path.write_text(musicxml, encoding="utf-8")
+    job_path.write_text(
+        json.dumps([{"in": str(musicxml_path), "out": [str(midi_path)]}]),
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        [str(executable), "-j", str(job_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+    exported_pitches = sorted(
+        message.note
+        for track in MidiFile(midi_path).tracks
+        for message in track
+        if message.type == "note_on" and message.velocity > 0
+    )
+    assert exported_pitches == sorted((*high, *low))
 
 
 def test_very_short_extreme_note_keeps_ledger_lines() -> None:

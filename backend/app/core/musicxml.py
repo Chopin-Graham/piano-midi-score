@@ -440,7 +440,11 @@ def _add_octave_shift(
         "octave-shift",
         type=shift_type,
         size=str(size),
-        number="1",
+        # MusicXML octave-shift numbers are part-wide, not staff-local.  Using
+        # number 1 for simultaneous 8va and 8vb lines lets importers pair a
+        # stop from one staff with the start on the other, leaking the octave
+        # transposition into later notes.  The grand staff has stable 1/2 IDs.
+        number=str(int(staff)),
     )
     if offset:
         ET.SubElement(direction, "offset").text = str(offset)
@@ -516,10 +520,8 @@ def _notation_atoms(
         if note.staff is None:
             continue
         # MusicXML pitch values remain at concert/sounding pitch under an
-        # octave-shift. Importers such as MuseScore use the octave-shift to
-        # derive the written staff position and restore the sounding pitch on
-        # playback/export. Pre-shifting the pitch here therefore applies the
-        # ottava twice (one octave for 8va/8vb, two for 15ma/15mb).
+        # octave-shift. MuseScore uses the direction for notation and must not
+        # receive a second pitch displacement in the note element.
         pieces = _split_note_across_measures(note.onset, note.duration, score)
         for index, (onset, duration) in enumerate(pieces):
             atoms.append(
