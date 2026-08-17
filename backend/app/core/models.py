@@ -113,6 +113,7 @@ class QuantizedNote:
     hand: Hand | None = None
     arpeggiated: bool = False
     trill: bool = False
+    grace: bool = False
 
     @property
     def end(self) -> int:

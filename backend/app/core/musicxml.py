@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from statistics import median
 from xml.etree import ElementTree as ET
 
@@ -43,6 +43,7 @@ class NotationNote:
     hand: Hand | None = None
     arpeggiated: bool = False
     trill: bool = False
+    grace: bool = False
 
 
 @dataclass(slots=True)
@@ -58,6 +59,7 @@ class VoiceItem:
     tuplet_stop: bool = False
     boundary_rest: bool = False
     hidden_rest: bool = False
+    grace_notes: list[NotationNote] = field(default_factory=list)
 
 
 DURATION_SPECS = [
@@ -535,7 +537,12 @@ def _notation_atoms(
         # MusicXML pitch values remain at concert/sounding pitch under an
         # octave-shift. MuseScore uses the direction for notation and must not
         # receive a second pitch displacement in the note element.
-        pieces = _split_note_across_measures(note.onset, note.duration, score)
+        # Grace notes are always short and never cross a barline, so they skip
+        # the measure splitter (a split grace would lose its attachment).
+        if note.grace:
+            pieces = [(note.onset, note.duration)]
+        else:
+            pieces = _split_note_across_measures(note.onset, note.duration, score)
         for index, (onset, duration) in enumerate(pieces):
             atoms.append(
                 NotationNote(
@@ -553,6 +560,7 @@ def _notation_atoms(
                     hand=note.hand,
                     arpeggiated=note.arpeggiated,
                     trill=note.trill and index == 0,
+                    grace=note.grace,
                 )
             )
     return sorted(atoms, key=lambda atom: (atom.onset, atom.staff, atom.voice, atom.pitch))
@@ -658,8 +666,25 @@ def _voice_items(
             )
         ]
 
+    grace_atoms = [atom for atom in atoms if atom.grace]
+    timed_atoms = [atom for atom in atoms if not atom.grace]
+    timed_onsets = {atom.onset for atom in timed_atoms}
+    attachable: list[NotationNote] = []
+    demoted: list[NotationNote] = []
+    for grace in grace_atoms:
+        target = grace.onset + grace.duration
+        if target in timed_onsets:
+            attachable.append(grace)
+        else:
+            demoted.append(replace(grace, grace=False))
+    if demoted:
+        timed_atoms = sorted(
+            [*timed_atoms, *demoted],
+            key=lambda atom: (atom.onset, atom.pitch),
+        )
+
     grouped: dict[tuple[int, int], list[NotationNote]] = defaultdict(list)
-    for atom in atoms:
+    for atom in timed_atoms:
         grouped[(atom.onset - measure_start, atom.duration)].append(atom)
 
     items: list[VoiceItem] = []
@@ -694,6 +719,12 @@ def _voice_items(
         )
     items = _complete_tuplet_groups(items, meter)
     _mark_beams(items, meter)
+    for grace in attachable:
+        target = grace.onset + grace.duration - measure_start
+        for item in items:
+            if not item.is_rest and item.onset == target:
+                item.grace_notes.append(grace)
+                break
     return items
 
 
@@ -1026,6 +1057,16 @@ def _write_item(
             if item.tuplet_stop:
                 ET.SubElement(notations, "tuplet", type="stop")
         return
+
+    for grace in item.grace_notes:
+        grace_element = ET.SubElement(measure, "note")
+        ET.SubElement(grace_element, "grace", slash="yes")
+        _write_pitch(grace_element, grace, fifths)
+        ET.SubElement(grace_element, "voice").text = str(voice)
+        ET.SubElement(grace_element, "type").text = "eighth"
+        if stem_direction:
+            ET.SubElement(grace_element, "stem").text = stem_direction
+        ET.SubElement(grace_element, "staff").text = str(int(staff))
 
     for note_index, notation_note in enumerate(item.notes):
         note_element = ET.SubElement(measure, "note")

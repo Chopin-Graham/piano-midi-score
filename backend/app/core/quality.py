@@ -220,7 +220,9 @@ def _count_voice_overlaps(notes: list[QuantizedNote]) -> int:
         lambda: defaultdict(list)
     )
     for note in notes:
-        if note.staff is None:
+        if note.staff is None or note.grace:
+            # Grace notes occupy no written time; they legitimately share the
+            # span their duration was returned to.
             continue
         events[(note.staff, note.voice)][(note.onset, note.duration)].append(note)
 

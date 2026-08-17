@@ -113,7 +113,15 @@ def quantize_midi(
             if binary_error is None or triplet_error is None:
                 continue
             total += 1
-            if triplet_error < binary_error * 0.6:
+            # Swing feels (long-short pairs at ~2:1) fit a triplet grid
+            # perfectly at the 0 and 2/3 positions, but only genuine triplets
+            # also populate the middle tatum.  Requiring one middle-tatum
+            # onset per voting measure keeps swung eighths out of the vote.
+            has_middle_tatum = any(
+                abs((note.onset - measure.start) % CANONICAL_DIVISIONS - 160) <= 40
+                for note in measure_notes
+            )
+            if has_middle_tatum and triplet_error < binary_error * 0.6:
                 votes += 1
         if total >= 4 and votes / total >= 0.12:
             candidate_options = probe

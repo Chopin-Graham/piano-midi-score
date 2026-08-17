@@ -30,7 +30,7 @@ from .models import (
 )
 from .musicxml import musicxml_readability_metrics, score_to_musicxml
 from .options import ConversionOptions
-from .ornaments import collapse_trills
+from .ornaments import collapse_trills, convert_grace_notes
 from .quality import evaluate_notation_quality
 from .quantizer import quantize_midi
 from .spelling import apply_pitch_spelling
@@ -170,6 +170,14 @@ def convert_midi_with_score(
     notes, voice_counts, voice_warnings = assign_voices(notes, options.max_voices_per_staff)
     warnings.extend(voice_warnings)
 
+    grace_count = 0
+    if options.audio_transcription and options.style != "faithful":
+        notes, grace_count = convert_grace_notes(notes)
+        if grace_count:
+            warnings.append(
+                f"将 {grace_count} 个拍前碎音按倚音记谱（时值已归还相邻音符，未删除任何音头）"
+            )
+
     key, key_changes, key_warnings = _key_timeline(
         parsed.key_signatures,
         notes,
@@ -276,6 +284,7 @@ def convert_midi_with_score(
         "ornaments": {
             "trills": trill_count,
             "trill_absorbed_attacks": trill_absorbed,
+            "grace_notes": grace_count,
         },
         "spelling": spelling_analysis,
         "notation": notation_analysis,

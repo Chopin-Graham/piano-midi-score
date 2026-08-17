@@ -18,6 +18,100 @@ MIN_TRILL_ATTACKS = 6
 MIN_TRILL_SPAN = (CANONICAL_DIVISIONS * 3) // 4  # about a dotted quarter of alternation
 MAX_TRILL_MEMBER = CANONICAL_DIVISIONS // 2  # members are eighth-note or faster
 
+# Durations with a single clean notehead/rest, mirroring musicxml.DURATION_SPECS.
+_CLEAN_DURATIONS = frozenset(
+    {
+        1920,
+        1440,
+        960,
+        720,
+        480,
+        360,
+        320,
+        240,
+        180,
+        160,
+        120,
+        90,
+        80,
+        60,
+        40,
+        30,
+    }
+)
+MAX_GRACE_DURATION = CANONICAL_DIVISIONS // 4  # a sixteenth note
+
+
+def convert_grace_notes(
+    notes: list[QuantizedNote],
+) -> tuple[list[QuantizedNote], int]:
+    """Rewrite isolated crushed notes before a beat as slashed grace notes.
+
+    Nakamura's performance-model measurements show that grace-note timing
+    overlaps ordinary short-note timing, so conversion requires converging
+    evidence: a single-cell note immediately before a longer, louder on-beat
+    note a step or third away, alone at its onset in its voice, off the beat
+    itself.  The grace's time is returned to the previous written note when
+    that restores a clean value (the typical case: the voice simplifier had
+    truncated that note to make room), otherwise a rest absorbs it.
+    """
+
+    by_voice: dict[tuple[Staff, int], list[QuantizedNote]] = defaultdict(list)
+    passthrough: list[QuantizedNote] = []
+    for note in notes:
+        if note.staff is None or note.grace:
+            passthrough.append(note)
+        else:
+            by_voice[(note.staff, note.voice)].append(note)
+
+    converted = 0
+    result = list(passthrough)
+    for voice_notes in by_voice.values():
+        ordered = sorted(voice_notes, key=lambda note: (note.onset, note.pitch))
+        converted_ids: set[int] = set()
+        extensions: dict[int, int] = {}
+        for index, note in enumerate(ordered[:-1]):
+            if note.source_id in converted_ids or note.trill or note.arpeggiated:
+                continue
+            if note.duration > MAX_GRACE_DURATION or note.onset % CANONICAL_DIVISIONS == 0:
+                continue
+            main = ordered[index + 1]
+            if (
+                main.onset != note.end
+                or main.onset % CANONICAL_DIVISIONS != 0
+                or main.trill
+                or main.duration < note.duration * 2
+                or note.velocity >= main.velocity
+            ):
+                continue
+            interval = abs(note.pitch - main.pitch)
+            if not 1 <= interval <= 3:
+                continue
+            if index and ordered[index - 1].onset == note.onset:
+                continue  # chord member, not a lone grace
+            previous = ordered[index - 1] if index else None
+            if previous is not None and previous.end > note.onset:
+                continue
+            if previous is not None and previous.end == note.onset:
+                restored = previous.duration + note.duration
+                if restored not in _CLEAN_DURATIONS:
+                    continue
+                extensions[previous.source_id] = restored
+            converted_ids.add(note.source_id)
+        for note in ordered:
+            if note.source_id in converted_ids:
+                result.append(replace(note, grace=True))
+                converted += 1
+            elif note.source_id in extensions:
+                result.append(replace(note, duration=extensions[note.source_id]))
+            else:
+                result.append(note)
+
+    return (
+        sorted(result, key=lambda note: (note.onset, note.pitch, note.source_id)),
+        converted,
+    )
+
 
 def collapse_trills(
     notes: list[QuantizedNote],
