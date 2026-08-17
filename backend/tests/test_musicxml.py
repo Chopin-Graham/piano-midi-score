@@ -789,3 +789,96 @@ def test_same_hand_polyphony_uses_local_register_for_stem_directions() -> None:
     }
 
     assert stems == {1: "down", 2: "up"}
+
+
+def test_triplet_rests_stay_inside_tuplet_brackets() -> None:
+    notes = [
+        QuantizedNote(1, 60, 1120, 240, 80, 0, 0, Staff.RIGHT),
+        QuantizedNote(2, 64, 1760, 160, 80, 0, 0, Staff.RIGHT),
+    ]
+    musicxml = score_to_musicxml(_score(notes))
+    root = ET.fromstring(musicxml)
+
+    starts = root.findall(".//notations/tuplet[@type='start']")
+    stops = root.findall(".//notations/tuplet[@type='stop']")
+    assert len(starts) == len(stops) == 2
+
+    # The triplet run opens on a rest: the rest must carry the start bracket.
+    first_member = root.findall(".//note")[1]
+    assert first_member.find("rest") is not None
+    assert first_member.find("notations/tuplet[@type='start']") is not None
+
+    assert musicxml_readability_metrics(musicxml)["unbalanced_tuplet_brackets"] == 0
+
+
+def test_compound_meter_eighths_are_not_rebranded_as_triplets() -> None:
+    meter = Meter(6, 8)
+    notes = [
+        QuantizedNote(index + 1, 60 + index, index * 240, 240, 80, 0, 0, Staff.RIGHT)
+        for index in range(6)
+    ]
+    root = ET.fromstring(score_to_musicxml(_score(notes, meter)))
+
+    assert not root.findall(".//time-modification")
+    assert not root.findall(".//notations/tuplet")
+
+
+def test_four_hundred_tick_triplet_member_splits_into_tied_members() -> None:
+    notes = [
+        QuantizedNote(1, 60, 0, 80, 80, 0, 0, Staff.RIGHT),
+        QuantizedNote(2, 62, 80, 400, 80, 0, 0, Staff.RIGHT),
+    ]
+    musicxml = score_to_musicxml(_score(notes))
+    root = ET.fromstring(musicxml)
+
+    split = [
+        note
+        for note in root.findall(".//note")
+        if note.findtext("pitch/step") == "D" and note.find("rest") is None
+    ]
+    assert len(split) == 2
+    assert split[0].find("tie[@type='start']") is not None
+    assert split[1].find("tie[@type='stop']") is not None
+    assert sum(int(note.findtext("duration") or "0") for note in split) == 400
+    assert musicxml_readability_metrics(musicxml)["unbalanced_tuplet_brackets"] == 0
+
+
+def test_musescore_loads_triplet_measures_with_rests(tmp_path: Path) -> None:
+    executable = find_musescore()
+    if executable is None:
+        pytest.skip("MuseScore is not installed")
+    notes = [
+        QuantizedNote(1, 60, 1120, 240, 80, 0, 0, Staff.RIGHT),
+        QuantizedNote(2, 64, 1760, 160, 80, 0, 0, Staff.RIGHT),
+    ]
+    musicxml_path = tmp_path / "triplet-rests.musicxml"
+    midi_path = tmp_path / "triplet-rests.mid"
+    job_path = tmp_path / "musescore-job.json"
+    musicxml_path.write_text(score_to_musicxml(_score(notes)), encoding="utf-8")
+    job_path.write_text(
+        json.dumps([{"in": str(musicxml_path), "out": [str(midi_path)]}]),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [str(executable), "-j", str(job_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    assert midi_path.is_file()
+
+    exported_pitches = sorted(
+        {
+            message.note
+            for track in MidiFile(midi_path).tracks
+            for message in track
+            if message.type == "note_on" and message.velocity > 0
+        }
+    )
+    assert exported_pitches == [60, 64]

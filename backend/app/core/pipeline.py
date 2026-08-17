@@ -12,7 +12,7 @@ from .hand_splitter import (
     assign_hands,
     mark_unredistributable_chords_for_arpeggiation,
 )
-from .key_detection import estimate_key, key_from_midi_name
+from .key_detection import estimate_key, estimate_key_timeline, key_from_midi_name
 from .meter_map import build_measure_map, measure_index_at
 from .midi_parser import parse_midi
 from .models import (
@@ -149,6 +149,7 @@ def convert_midi_with_score(
         pedals=analysis_pedals,
         measures=measures,
         transcription_mode=options.audio_transcription,
+        grid_decisions=grid_decisions,
     )
     warnings.extend(duration_warnings)
     notes, voice_counts, voice_warnings = assign_voices(notes, options.max_voices_per_staff)
@@ -160,6 +161,7 @@ def convert_midi_with_score(
         measures,
         scale=scale,
         timeline_shift=shift,
+        infer_key=options.infer_key,
     )
     warnings.extend(key_warnings)
     if key.confidence < 0.18:
@@ -292,6 +294,7 @@ def _key_timeline(
     *,
     scale: float,
     timeline_shift: int,
+    infer_key: bool = True,
 ) -> tuple[KeyEstimate, list[KeyChange], list[str]]:
     """Preserve explicit MIDI key changes and only infer when they are absent."""
 
@@ -323,8 +326,15 @@ def _key_timeline(
         by_measure[measure_index] = parsed_key
 
     if not by_measure:
-        inferred = estimate_key(notes)
-        return inferred, [KeyChange(0, inferred)], warnings
+        if not infer_key:
+            default_key = KeyEstimate(0, "major", 0, 1.0)
+            return default_key, [KeyChange(0, default_key)], warnings
+        timeline = estimate_key_timeline(notes, measures)
+        if len(timeline) > 1:
+            warnings.append(
+                f"检测到 {len(timeline) - 1} 次转调，已按小节标注调号变化"
+            )
+        return timeline[0].key, timeline, warnings
 
     if 0 not in by_measure:
         opening_notes = [

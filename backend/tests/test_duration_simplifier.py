@@ -1,5 +1,12 @@
 from app.core.duration_simplifier import simplify_polyphonic_durations
-from app.core.models import MeasureSpan, Meter, PedalEvent, QuantizedNote, Staff
+from app.core.models import (
+    GridDecision,
+    MeasureSpan,
+    Meter,
+    PedalEvent,
+    QuantizedNote,
+    Staff,
+)
 from app.core.voices import assign_voices
 
 
@@ -357,3 +364,36 @@ def test_audio_transcription_closes_monophonic_offbeat_release_to_next_attack() 
     )
 
     assert next(note for note in transcribed if note.source_id == 1).duration == 360
+
+
+def test_audio_transcription_release_cell_follows_triplet_grid() -> None:
+    meter = Meter(4, 4)
+    measures = [MeasureSpan(0, 0, meter.measure_length, meter)]
+    notes = [
+        QuantizedNote(1, 72, 0, 160, 82, 0, 0, Staff.RIGHT),
+        QuantizedNote(2, 74, 320, 160, 84, 0, 0, Staff.RIGHT),
+    ]
+    triplet_grid = [GridDecision(0, "eighth_triplet", 160, 0.0, True)]
+
+    transcribed, _, _ = simplify_polyphonic_durations(
+        notes,
+        max_voices=2,
+        style="clean",
+        measures=measures,
+        transcription_mode=True,
+        grid_decisions=triplet_grid,
+    )
+
+    assert next(note for note in transcribed if note.source_id == 1).duration == 320
+
+    binary, _, _ = simplify_polyphonic_durations(
+        notes,
+        max_voices=2,
+        style="clean",
+        measures=measures,
+        transcription_mode=True,
+    )
+
+    # Without grid information the release cell stays binary and manufactures a
+    # 240-tick value that does not exist on the triplet grid.
+    assert next(note for note in binary if note.source_id == 1).duration == 240

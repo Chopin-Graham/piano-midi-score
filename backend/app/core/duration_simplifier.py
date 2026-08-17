@@ -4,8 +4,10 @@ from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import replace
 
+from .meter_map import measure_index_at
 from .models import (
     CANONICAL_DIVISIONS,
+    GridDecision,
     MeasureSpan,
     PedalEvent,
     QuantizedNote,
@@ -22,6 +24,7 @@ def simplify_polyphonic_durations(
     pedals: list[PedalEvent] | None = None,
     measures: list[MeasureSpan] | None = None,
     transcription_mode: bool = False,
+    grid_decisions: list[GridDecision] | None = None,
 ) -> tuple[list[QuantizedNote], dict[str, object], list[str]]:
     """Reduce performance-only overlaps while preserving every note attack.
 
@@ -61,6 +64,7 @@ def simplify_polyphonic_durations(
                 measures or [],
                 style,
                 pedals or [],
+                grid_decisions=grid_decisions,
             )
         )
     shortened = 0
@@ -173,6 +177,7 @@ def _extend_transcription_release_gaps(
     measures: list[MeasureSpan],
     style: str,
     pedals: list[PedalEvent],
+    grid_decisions: list[GridDecision] | None = None,
 ) -> tuple[list[QuantizedNote], int, int]:
     """Infer conventional written releases from noisy audio offsets.
 
@@ -198,8 +203,24 @@ def _extend_transcription_release_gaps(
     # no farther than an eighth note, while balanced output stays at a
     # sixteenth.  Longer values require stronger evidence from the original
     # release, a melodic/bass edge, or continuous pedal under a low bass note.
-    attack_cell = CANONICAL_DIVISIONS // (2 if style == "clean" else 4)
-    maximum_gap = attack_cell
+    # The cell follows the measure's quantization grid: in triplet measures a
+    # binary cell would manufacture mixed-grid items whose tuplet brackets
+    # cannot close (MuseScore then reports the measure as corrupt).
+    base_cell = CANONICAL_DIVISIONS // (2 if style == "clean" else 4)
+    grid_steps = {
+        decision.measure_index: decision.step for decision in grid_decisions or []
+    }
+
+    def cell_at(onset: int) -> int:
+        if not measures or not grid_steps:
+            return base_cell
+        step = grid_steps.get(measure_index_at(measures, onset))
+        if step == CANONICAL_DIVISIONS // 3:
+            return CANONICAL_DIVISIONS // 3
+        if step == CANONICAL_DIVISIONS // 6:
+            return CANONICAL_DIVISIONS // (3 if style == "clean" else 6)
+        return base_cell
+
     coverage = PedalCoverage(pedals)
     onsets_by_staff: dict[Staff, list[int]] = defaultdict(list)
     notes_by_attack: dict[tuple[Staff, int], list[QuantizedNote]] = defaultdict(list)
@@ -226,6 +247,8 @@ def _extend_transcription_release_gaps(
         if note.staff is None:
             result.append(note)
             continue
+        attack_cell = cell_at(note.onset)
+        maximum_gap = attack_cell
         later_onsets = onsets_by_staff[note.staff]
         next_index = bisect_right(later_onsets, note.onset)
         next_onset = (

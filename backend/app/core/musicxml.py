@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from statistics import median
 from xml.etree import ElementTree as ET
 
@@ -78,6 +78,18 @@ DURATION_SPECS = [
     DurationSpec(30, "64th"),
 ]
 SPEC_BY_VALUE = {spec.value: spec for spec in DURATION_SPECS}
+
+# Inside a complete triplet beat every item must be a triplet member, including
+# rests; a binary eighth between two triplet-eighths breaks MuseScore's tuplet
+# accounting (it then reports the whole measure as corrupt and refuses to
+# load the file).  These specs re-express group members on the triplet grid.
+TRIPLET_SPECS = {
+    80: DurationSpec(80, "16th", 0, (3, 2)),
+    160: DurationSpec(160, "eighth", 0, (3, 2)),
+    240: DurationSpec(240, "eighth", 1, (3, 2)),
+    320: DurationSpec(320, "quarter", 0, (3, 2)),
+}
+TRIPLET_GROUP = CANONICAL_DIVISIONS  # one beat of 3:2 eighth-note triplets
 
 SHARP_PITCHES = {
     0: ("C", 0),
@@ -678,7 +690,7 @@ def _voice_items(
         raise ValueError(
             f"声部时值总和不等于小节长度：{sum(item.duration for item in items)} != {measure_length}"
         )
-    _mark_tuplets(items, meter)
+    items = _complete_tuplet_groups(items, meter)
     _mark_beams(items, meter)
     return items
 
@@ -834,20 +846,114 @@ def _rest_items(
     ]
 
 
-def _mark_tuplets(items: list[VoiceItem], meter: Meter) -> None:
-    run: list[VoiceItem] = []
-    for item in items + [VoiceItem(0, 0, DurationSpec(0, "quarter"), [], True)]:
-        same_group = bool(run) and _metric_group_index(
-            item.onset, meter
-        ) == _metric_group_index(run[0].onset, meter)
-        contiguous = bool(run) and run[-1].onset + run[-1].duration == item.onset
-        if item.spec.time_modification and (not run or (same_group and contiguous)):
-            run.append(item)
+def _complete_tuplet_groups(items: list[VoiceItem], meter: Meter) -> list[VoiceItem]:
+    """Re-express triplet content so every tuplet bracket is complete.
+
+    MuseScore refuses to load a score whose tuplet stop lacks its start — which
+    happened whenever a triplet run began or ended on a rest, because rests
+    never received the notation — or whose triplet group mixes binary and
+    triplet values.  Here triplet-grid runs are re-specified member by member
+    (rests included), values like 400 ticks are split into tied triplet
+    members, and brackets are emitted only for groups that sum to whole
+    triplet beats.  A run that still cannot be completed loses its tuplet
+    markup instead of corrupting the measure: the real durations stay exact,
+    so the file remains loadable and rhythmically truthful.
+    """
+
+    expanded: list[VoiceItem] = []
+    for item in items:
+        expanded.extend(_split_odd_triplet_member(item))
+
+    # Candidate runs are maximal contiguous chains of triplet-grid items, but
+    # a run must contain at least one genuine time-modification member —
+    # otherwise plain binary eighths in 6/8 would be rebranded as triplets.
+    result: list[VoiceItem] = []
+    index = 0
+    while index < len(expanded):
+        item = expanded[index]
+        eligible = bool(item.spec.time_modification) or item.duration in TRIPLET_SPECS
+        if not eligible:
+            result.append(item)
+            index += 1
             continue
-        if run:
-            run[0].tuplet_start = True
-            run[-1].tuplet_stop = True
-        run = [item] if item.spec.time_modification else []
+        stop = index + 1
+        while (
+            stop < len(expanded)
+            and (
+                expanded[stop].spec.time_modification
+                or expanded[stop].duration in TRIPLET_SPECS
+            )
+            and expanded[stop - 1].onset + expanded[stop - 1].duration
+            == expanded[stop].onset
+        ):
+            stop += 1
+        run = expanded[index:stop]
+        if any(member.spec.time_modification for member in run):
+            result.extend(_bracket_triplet_run(run))
+        else:
+            result.extend(run)
+        index = stop
+    return result
+
+
+def _split_odd_triplet_member(item: VoiceItem) -> list[VoiceItem]:
+    """Split a triplet-grid value with no single notehead (400 = 320+80)."""
+
+    if item.is_rest or item.spec.time_modification or item.duration != 400:
+        return [item]
+    if any(note.tie_start or note.tie_stop for note in item.notes):
+        # Already part of a tie chain; leave the exact value untouched rather
+        # than disturbing the surrounding notation.
+        return [item]
+    first_spec = TRIPLET_SPECS[320]
+    second_spec = TRIPLET_SPECS[80]
+    first_notes = [replace(note, tie_start=True) for note in item.notes]
+    second_notes = [replace(note, tie_stop=True) for note in item.notes]
+    return [
+        VoiceItem(item.onset, 320, first_spec, first_notes),
+        VoiceItem(item.onset + 320, 80, second_spec, second_notes),
+    ]
+
+
+def _bracket_triplet_run(run: list[VoiceItem]) -> list[VoiceItem]:
+    for item in run:
+        if not item.spec.time_modification:
+            item.spec = TRIPLET_SPECS[item.duration]
+
+    groups: list[list[VoiceItem]] = []
+    current: list[VoiceItem] = []
+    accumulated = 0
+    for item in run:
+        current.append(item)
+        accumulated += item.duration
+        if accumulated % TRIPLET_GROUP == 0:
+            groups.append(current)
+            current = []
+            accumulated = 0
+    if current:
+        # Incomplete final fragment: cannot form a valid 3:2 tuplet.  Fall back
+        # to plain binary display types with exact durations so the measure
+        # stays loadable instead of emitting an unbalanced bracket.
+        for item in run:
+            item.spec = _binary_fallback_spec(item.duration)
+            item.tuplet_start = False
+            item.tuplet_stop = False
+        return run
+    for group in groups:
+        group[0].tuplet_start = True
+        group[-1].tuplet_stop = True
+    return run
+
+
+def _binary_fallback_spec(duration: int) -> DurationSpec:
+    fallbacks = {
+        80: DurationSpec(80, "32nd"),
+        160: DurationSpec(160, "16th"),
+        240: DurationSpec(240, "eighth"),
+        320: DurationSpec(320, "eighth", 1),
+        400: DurationSpec(400, "eighth", 1),
+    }
+    return fallbacks.get(duration, DurationSpec(duration, "64th"))
 
 
 def _mark_beams(items: list[VoiceItem], meter: Meter) -> None:
@@ -908,6 +1014,15 @@ def _write_item(
             stem_direction,
             first_in_chord=True,
         )
+        # Rests are full tuplet members in MusicXML; without the bracket a
+        # triplet group starting or ending on a rest corrupts the measure for
+        # stricter importers such as MuseScore.
+        if item.tuplet_start or item.tuplet_stop:
+            notations = ET.SubElement(note_element, "notations")
+            if item.tuplet_start:
+                ET.SubElement(notations, "tuplet", type="start", bracket="auto")
+            if item.tuplet_stop:
+                ET.SubElement(notations, "tuplet", type="stop")
         return
 
     for note_index, notation_note in enumerate(item.notes):
@@ -1060,6 +1175,8 @@ def musicxml_readability_metrics(musicxml: str) -> dict[str, object]:
         for shift in octave_shifts
         if shift.get("type") in {"up", "down"}
     ]
+    tuplet_starts = root.findall(".//notations/tuplet[@type='start']")
+    tuplet_stops = root.findall(".//notations/tuplet[@type='stop']")
     return {
         "hidden_padding_rests": sum(note.get("print-object") == "no" for note in rests),
         "visible_rests": sum(note.get("print-object") != "no" for note in rests),
@@ -1072,4 +1189,6 @@ def musicxml_readability_metrics(musicxml: str) -> dict[str, object]:
             sorted(Counter(int(shift.get("size", "8")) for shift in starts).items())
         ),
         "arpeggiated_noteheads": len(root.findall(".//notations/arpeggiate")),
+        "tuplet_spans": len(tuplet_starts),
+        "unbalanced_tuplet_brackets": abs(len(tuplet_starts) - len(tuplet_stops)),
     }
