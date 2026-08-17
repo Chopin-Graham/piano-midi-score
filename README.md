@@ -101,7 +101,7 @@ npm run build --prefix frontend
 npm audit --prefix frontend --audit-level=moderate
 ```
 
-当前验证基线（2026-08-17）：后端 98 项测试全部通过、总覆盖率 84%；Ruff 通过；前端 5 项测试、TypeScript 类型检查和生产构建通过；npm audit 为 0 个漏洞；音频后端安装脚本通过 PowerShell 语法检查。341.7 秒参考视频已通过本机 `/api/convert-media` 完成 Transkun + CUDA、动态节拍对齐、MIDI、MusicXML 和 A4 PDF 的真实全链路验收。
+当前验证基线（2026-08-18）：后端 149 项测试全部通过；Ruff 通过；前端 5 项测试、TypeScript 类型检查和生产构建通过。音频/视频全链路新增回环验收：转录 MIDI 经 MuseScore 回读的起音 F1 为 0.9967（0.12 拍容差，含弱起重组偏移校正），成谱合成音频与原录音的 CENS 色度相似度 0.74；29 个真实下载 MIDI 的全量语义门禁与历史基线一致（0 同声部重叠、0 谱表误放新增）。
 
 复杂回归样例位于 `artifacts/regression-expressive-piano.mid`，最终验收产物位于 `output/pdf/` 和 `artifacts/`。
 
