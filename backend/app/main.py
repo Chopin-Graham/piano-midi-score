@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import json
+from io import BytesIO
 from pathlib import Path
 from typing import Annotated
+from xml.etree import ElementTree as ET
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -15,7 +17,7 @@ from pydantic import ValidationError
 
 from . import __version__
 from .core.demo import demo_midi_bytes
-from .core.engraver import engraver_status, render_a4_musicxml
+from .core.engraver import engraver_status, find_musescore, render_a4_musicxml
 from .core.media_transcription import (
     MEDIA_EXTENSIONS,
     MediaTranscriptionError,
@@ -25,11 +27,13 @@ from .core.media_transcription import (
 from .core.midi_parser import MidiParseError
 from .core.options import ConversionOptions, TranscriptionOptions
 from .core.pipeline import convert_midi
+from .core.roundtrip import musicxml_to_midi_bytes
 from .schemas import ConversionResponse, HealthResponse, OptionsResponse
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_MEDIA_UPLOAD_BYTES = 250 * 1024 * 1024
 SUPPORTED_EXTENSIONS = {".mid", ".midi"}
+SCORE_EXTENSIONS = {".musicxml", ".xml", ".mxl"}
 
 app = FastAPI(
     title="Piano MIDI Score",
@@ -75,13 +79,13 @@ async def convert(
 ) -> ConversionResponse:
     filename = Path(file.filename or "score.mid").name
     extension = Path(filename).suffix.lower()
-    if extension not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(status_code=415, detail="仅支持 .mid 和 .midi 文件")
+    if extension not in SUPPORTED_EXTENSIONS | SCORE_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="仅支持 .mid、.midi 或 .musicxml/.xml/.mxl 文件")
 
     data = await file.read(MAX_UPLOAD_BYTES + 1)
     await file.close()
     if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="MIDI 文件不能超过 10 MB")
+        raise HTTPException(status_code=413, detail="文件不能超过 10 MB")
 
     try:
         raw_options = json.loads(options_json)
@@ -90,6 +94,9 @@ async def convert(
         raise HTTPException(status_code=422, detail="options_json 不是有效 JSON") from exc
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
+
+    if extension in SCORE_EXTENSIONS:
+        return await _convert_score_upload(data, filename, conversion_options)
 
     try:
         musicxml, analysis, warnings = await run_in_threadpool(
@@ -121,6 +128,116 @@ async def convert(
         analysis=analysis,
         warnings=list(dict.fromkeys(warnings)),
     )
+
+
+async def _convert_score_upload(
+    data: bytes,
+    filename: str,
+    conversion_options: ConversionOptions,
+) -> ConversionResponse:
+    """Render an uploaded MusicXML score to A4 PDF and export its MIDI.
+
+    The file is already engraved notation, so the semantic MIDI pipeline
+    (quantization, hand splitting, voice separation) is deliberately not
+    applied; MuseScore handles both the PDF layout and the MIDI export.
+    """
+
+    musicxml = _decode_score_upload(data, filename)
+    engraving = await run_in_threadpool(
+        render_a4_musicxml,
+        musicxml,
+        conversion_options.engraving_style,
+    )
+    warnings = list(engraving.warnings)
+    warnings.append(
+        "MusicXML 输入按原谱直接雕版，未经过量化与分手流水线；需要语义清理时请上传 MIDI 源文件"
+    )
+    midi_bytes: bytes | None = None
+    executable = find_musescore()
+    if executable is not None:
+        try:
+            midi_bytes = await run_in_threadpool(
+                musicxml_to_midi_bytes,
+                musicxml,
+                executable,
+            )
+        except (OSError, RuntimeError) as exc:
+            warnings.append(f"MIDI 导出失败：{exc}")
+    else:
+        warnings.append("未找到 MuseScore Studio 4，无法从 MusicXML 导出 MIDI")
+
+    stem = Path(filename).stem or "score"
+    return ConversionResponse(
+        filename=f"{stem}.musicxml",
+        musicxml=musicxml,
+        midi_filename=f"{stem}.mid" if midi_bytes else None,
+        midi_base64=_encode_bytes(midi_bytes),
+        pdf_filename=f"{stem}-A4.pdf" if engraving.pdf_bytes else None,
+        pdf_base64=_encode_bytes(engraving.pdf_bytes),
+        preview_png_base64=_encode_bytes(engraving.preview_png),
+        analysis=_score_upload_analysis(musicxml, filename, engraving.analysis),
+        warnings=list(dict.fromkeys(warnings)),
+    )
+
+
+def _decode_score_upload(data: bytes, filename: str) -> str:
+    extension = Path(filename).suffix.lower()
+    if extension == ".mxl":
+        import zipfile
+
+        try:
+            with zipfile.ZipFile(BytesIO(data)) as archive:
+                container = None
+                if "META-INF/container.xml" in archive.namelist():
+                    container = ET.fromstring(archive.read("META-INF/container.xml"))
+                    rootfile = container.find(".//rootfile")
+                    if rootfile is not None and rootfile.get("full-path"):
+                        member = rootfile.get("full-path")
+                        assert member is not None
+                        data = archive.read(member)
+                    else:
+                        container = None
+                if container is None:
+                    member = next(
+                        name
+                        for name in archive.namelist()
+                        if name.lower().endswith((".musicxml", ".xml"))
+                        and not name.startswith("META-INF")
+                    )
+                    data = archive.read(member)
+        except (zipfile.BadZipFile, KeyError, StopIteration, ET.ParseError) as exc:
+            raise HTTPException(status_code=400, detail=f"无法读取 compressed MusicXML：{exc}") from exc
+    try:
+        text = data.decode("utf-8-sig")
+        root = ET.fromstring(text)
+    except (UnicodeDecodeError, ET.ParseError) as exc:
+        raise HTTPException(status_code=400, detail=f"不是有效的 MusicXML 文件：{exc}") from exc
+    if root.tag not in {"score-partwise", "score-timewise"}:
+        raise HTTPException(status_code=400, detail=f"不是 MusicXML 乐谱（根元素 {root.tag}）")
+    return text
+
+
+def _score_upload_analysis(
+    musicxml: str,
+    filename: str,
+    engraving_analysis: dict[str, object],
+) -> dict[str, object]:
+    root = ET.fromstring(musicxml)
+    title = (
+        root.findtext("./work/work-title")
+        or root.findtext("./movement-title")
+        or Path(filename).stem
+    )
+    measures = root.findall(".//measure")
+    return {
+        "title": title.strip() or Path(filename).stem,
+        "note_count": sum(
+            note.find("pitch") is not None for note in root.findall(".//note")
+        ),
+        "measure_count": len(measures),
+        "source": {"format": "musicxml", "semantic_pipeline": False},
+        "engraving": engraving_analysis,
+    }
 
 
 @app.post("/api/convert-media", response_model=ConversionResponse)

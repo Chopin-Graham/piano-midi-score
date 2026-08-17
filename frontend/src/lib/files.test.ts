@@ -10,8 +10,10 @@ import {
 } from "./files";
 
 describe("input file helpers", () => {
-  it("classifies MIDI, audio, and video extensions case-insensitively", () => {
+  it("classifies MIDI, score, audio, and video extensions case-insensitively", () => {
     assert.equal(classifyInputFilename("piece.MIDI"), "midi");
+    assert.equal(classifyInputFilename("score.MusicXML"), "score");
+    assert.equal(classifyInputFilename("score.mxl"), "score");
     assert.equal(classifyInputFilename("piano.flac"), "media");
     assert.equal(classifyInputFilename("performance.MP4"), "media");
     assert.equal(classifyInputFilename("notes.pdf"), null);

@@ -205,6 +205,18 @@ def _estimate_global_offset(
     return best_shift
 
 
+def musicxml_to_midi_bytes(musicxml: str, executable: Path) -> bytes:
+    """Convert MusicXML to MIDI through MuseScore's own importer/exporter."""
+
+    with tempfile.TemporaryDirectory(prefix="piano-xml-to-midi-") as temporary:
+        workdir = Path(temporary)
+        xml_path = workdir / "input.musicxml"
+        midi_path = workdir / "output.mid"
+        xml_path.write_text(musicxml, encoding="utf-8")
+        musescore_convert(executable, xml_path, midi_path)
+        return midi_path.read_bytes()
+
+
 def musescore_convert(
     executable: Path,
     input_path: Path,

@@ -96,3 +96,36 @@ def test_demo_endpoint() -> None:
     payload = response.json()
     assert payload["analysis"]["note_count"] == 16
     assert payload["musicxml"].count("<pedal ") == 2
+
+
+def test_convert_endpoint_accepts_musicxml_upload() -> None:
+    from app.core.pipeline import convert_midi
+
+    musicxml, _, _ = convert_midi(piano_midi_bytes(), "piece.mid")
+    response = request(
+        "POST",
+        "/api/convert",
+        files={"file": ("piece.musicxml", musicxml.encode("utf-8"), "text/xml")},
+        data={"options_json": "{}"},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["filename"] == "piece.musicxml"
+    assert payload["analysis"]["source"]["format"] == "musicxml"
+    assert payload["analysis"]["note_count"] > 0
+    if payload["pdf_base64"]:
+        assert base64.b64decode(payload["pdf_base64"]).startswith(b"%PDF")
+    if payload["midi_base64"]:
+        assert base64.b64decode(payload["midi_base64"]).startswith(b"MThd")
+
+
+def test_convert_endpoint_rejects_invalid_musicxml() -> None:
+    response = request(
+        "POST",
+        "/api/convert",
+        files={"file": ("piece.musicxml", b"not xml at all", "text/xml")},
+        data={"options_json": "{}"},
+    )
+
+    assert response.status_code == 400

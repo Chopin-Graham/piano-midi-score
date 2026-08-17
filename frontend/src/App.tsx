@@ -74,7 +74,7 @@ export default function App() {
     if (!nextFile) return;
     const nextKind = classifyInputFilename(nextFile.name);
     if (!nextKind) {
-      setError("请选择 MIDI、常见音频或视频文件");
+      setError("请选择 MIDI、MusicXML、常见音频或视频文件");
       return;
     }
     if (nextFile.size > uploadLimitBytes(nextKind)) {
