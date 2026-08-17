@@ -35,21 +35,24 @@ MuseScore 不可用时，流程在 MusicXML 处安全降级，网页使用 OpenS
 | 模块 | 职责 |
 | --- | --- |
 | `midi_parser.py` | 解析音符、轨道、通道、速度、速度变化、拍号、调号和 CC64 踏板事件 |
-| `quantizer.py` | 逐小节比较二分、三连音等候选网格，兼顾时间误差与谱面复杂度 |
+| `quantizer.py` | 逐小节比较二分、三连音等候选网格，兼顾时间误差与谱面复杂度；音频模式按全局证据自动启用三连音（中间 tatum 占位防摇摆误判） |
 | `hand_splitter.py` | 物理双手分配、五指/大十度门禁、通道级踏板覆盖、持续音前瞻与回溯修复 |
 | `staff_assigner.py` | 独立选择高低音谱表，最小化加线、和弦拆分和频繁换谱表 |
 | `piano_rules.py` | 标准钢琴音域、手距、琴键几何、五指规则和踏板覆盖区间的单一事实来源 |
-| `duration_simplifier.py` | 将踏板或演奏造成的轻微重叠规范成可写时值；音频模式还把碎小释放间隙延至下一起音/节拍边界，始终保留全部音头 |
+| `duration_simplifier.py` | 将踏板或演奏造成的轻微重叠规范成可写时值；音频模式还把碎小释放间隙延至下一起音/节拍边界，始终保留全部音头；释放单元随小节网格（含三连音）自适应 |
+| `ornaments.py` | 转录装饰音识别：快速二度严格交替合并为颤音记号；拍前碎音在多重证据一致时按倚音记谱并归还时值 |
+| `key_detection.py` | Krumhansl 调性估计；无调号事件时按滑动窗口 + Viterbi 平滑 + 短段坍缩生成小节级调号时间线 |
 | `voices.py` | 以 Partitura Chew–Wu 结果作为旋律路径提示，再做无重叠区间打包 |
 | `spelling.py` | 使用 Partitura PS13 生成上下文相关的音名和临时升降号 |
 | `clefs.py` | 在小节边界或必要的小节内部规划高音/低音谱号变化，检查跨边界持续音并抑制频繁切换 |
 | `ottava.py` | 检测真正处于同一极端音区的乐句，规划 8va/8vb 与少量 15ma/15mb；过短或混合音区素材保留加线 |
 | `quality.py` | 检查音符数、同声部重叠、极端谱表误放，以及清理前原始持续音的不可演奏跨度 |
-| `musicxml.py` | 生成双谱表 MusicXML、休止符、连音线、踏板线、谱号变化、八度线和显式系统提示；用 `forward/backup` 精确锚定小节中部事件 |
+| `musicxml.py` | 生成双谱表 MusicXML、休止符、连音线、踏板线、谱号变化、八度线和显式系统提示；连音组按完整性构造（休止符同为连音成员），用 `forward/backup` 精确锚定小节中部事件 |
 | `engraver.py` | 调用 MuseScore CLI，应用用户选择的雕版样式，验证 A4、页数和每系统小节数，生成 PDF/PNG |
-| `media_transcription.py` | FFmpeg 音频抽取、Transkun/Basic Pitch 调度、节拍估计、转录音符清理与标准 MIDI 输出 |
-| `audio_worker.py` | 在隔离音频环境中运行 Librosa 节拍分析，避免模型依赖污染主服务环境 |
-| `main.py` | FastAPI 上传边界、参数校验、线程池执行、Base64 输出与前端托管 |
+| `media_transcription.py` | FFmpeg 音频抽取、Transkun/Basic Pitch 调度、节拍估计、拍号/强拍相位检测、转录音符清理与标准 MIDI 输出 |
+| `audio_worker.py` | 在隔离音频环境中运行 Librosa 节拍分析与音频相似度计算，避免模型依赖污染主服务环境 |
+| `roundtrip.py` | 回环评估：MusicXML 经 MuseScore 回读为 MIDI，拍域起音 F1、色度音频相似度、PDF 逐页 PNG |
+| `main.py` | FastAPI 上传边界（MIDI/MusicXML/音视频）、参数校验、线程池执行、Base64 输出与前端托管 |
 
 ## 左右手分配
 
