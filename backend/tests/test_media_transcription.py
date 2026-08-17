@@ -6,6 +6,7 @@ import mido
 
 from app.core.media_transcription import (
     _align_attack_columns,
+    _attack_column_window,
     _beat_mapper,
     _clean_notes,
     _estimate_meter_and_downbeat,
@@ -208,3 +209,21 @@ def test_estimate_meter_shifts_barlines_onto_downbeats() -> None:
 
     assert meter == 4
     assert phase == 1.0
+
+
+def test_attack_column_window_preserves_fast_thirty_seconds() -> None:
+    # 144 BPM content: a 32nd is ~52 ms; chord jitter stays below 25 ms.
+    seconds_per_beat = 60.0 / 144
+    notes: list[_TimedNote] = []
+    for index in range(16):
+        onset = index * seconds_per_beat / 8
+        notes.append(_TimedNote(60 + index % 5, onset, onset + 0.04, 80))
+    # A genuine chord with 20 ms jitter on the third 32nd.
+    notes.append(_TimedNote(64, 3 * seconds_per_beat / 8 + 0.02, 3 * seconds_per_beat / 8 + 0.06, 76))
+    window = _attack_column_window(notes, 120.0)
+    assert 0.025 <= window <= 0.045
+
+    aligned, analysis = _align_attack_columns(notes, window)
+
+    assert analysis["attack_columns_after"] >= 16
+    assert analysis["attack_columns_after"] < analysis["attack_columns_before"]

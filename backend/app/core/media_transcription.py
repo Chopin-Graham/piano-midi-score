@@ -425,7 +425,10 @@ def _postprocess_midi(
     if not cleaned:
         raise MediaTranscriptionError("The transcription contained no usable piano notes")
 
-    aligned, attack_analysis = _align_attack_columns(cleaned)
+    aligned, attack_analysis = _align_attack_columns(
+        cleaned,
+        _attack_column_window(cleaned, source_tempo),
+    )
     mapper, tempo_bpm, alignment_method, tempo_analysis = _select_timeline_mapper(
         beat_times,
         aligned,
@@ -619,6 +622,19 @@ def _clean_notes(
             "same_pitch_overlap_repairs": overlap_repairs,
         },
     )
+
+
+def _attack_column_window(notes: list[_TimedNote], source_tempo: float) -> float:
+    """Tempo-aware chord-jitter window in seconds.
+
+    Onset-interval histograms of model output show chord jitter below ~30 ms
+    and real successions from ~45 ms up.  A fixed 60 ms window merges genuine
+    thirty-second notes at brisk tempos (a 32nd is ~52 ms at 144 BPM), so the
+    window scales with the estimated beat period and stays inside the valley.
+    """
+
+    tempo = _estimate_note_tempo(notes, source_tempo)
+    return min(0.045, max(0.025, (60.0 / tempo) / 12))
 
 
 def _align_attack_columns(
