@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from .models import CANONICAL_DIVISIONS, MeasureSpan, Meter, ParsedMidi
 
 
@@ -92,6 +94,52 @@ def build_measure_map(
         ]
 
     return measures, shift, warnings
+
+
+def reframe_audio_pickup(
+    measures: list[MeasureSpan],
+    notes: list,
+) -> tuple[list[MeasureSpan], list, int]:
+    """Reframe a transcription's leading empty beats as a pickup measure.
+
+    Beat alignment maps seconds to a beat grid but never decides which beat is
+    the downbeat, so a piece that enters after beat one otherwise opens with a
+    bar full of rests.  When the first measure is empty up to the first
+    (grid-aligned) onset, that leading segment becomes an implicit pickup bar;
+    all later barlines keep their relative positions, only the origin moves.
+    Returns the new measure map, the shifted notes, and the extra shift.
+    """
+
+    if not measures or not notes:
+        return measures, notes, 0
+    first = measures[0]
+    if first.implicit:
+        return measures, notes, 0
+    first_onset = min(note.onset for note in notes)
+    pickup_start = first_onset - first.start
+    if pickup_start <= 0 or pickup_start >= first.duration:
+        return measures, notes, 0
+
+    pickup = MeasureSpan(
+        index=0,
+        start=0,
+        duration=first.duration - pickup_start,
+        meter=first.meter,
+        implicit=True,
+    )
+    reframed = [pickup]
+    for measure in measures[1:]:
+        reframed.append(
+            MeasureSpan(
+                index=measure.index,
+                start=measure.start - pickup_start,
+                duration=measure.duration,
+                meter=measure.meter,
+                implicit=measure.implicit,
+            )
+        )
+    shifted = [replace(note, onset=note.onset - pickup_start) for note in notes]
+    return reframed, shifted, pickup_start
 
 
 def measure_index_at(measures: list[MeasureSpan], onset: int) -> int:

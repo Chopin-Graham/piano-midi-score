@@ -13,7 +13,7 @@ from .hand_splitter import (
     mark_unredistributable_chords_for_arpeggiation,
 )
 from .key_detection import estimate_key, estimate_key_timeline, key_from_midi_name
-from .meter_map import build_measure_map, measure_index_at
+from .meter_map import build_measure_map, measure_index_at, reframe_audio_pickup
 from .midi_parser import parse_midi
 from .models import (
     CANONICAL_DIVISIONS,
@@ -77,6 +77,11 @@ def convert_midi_with_score(
     )
     warnings.extend(quantizer_warnings)
     quantized_note_count = len(notes)
+    if options.audio_transcription and notes:
+        measures, notes, pickup_shift = reframe_audio_pickup(measures, notes)
+        if pickup_shift:
+            shift += pickup_shift
+            warnings.append("检测到弱起进入，开头空拍已重组为弱起小节（不完全小节）")
     scale = CANONICAL_DIVISIONS / parsed.ticks_per_beat
     # Pedal is musical timing evidence even when the user chooses not to print
     # pedal lines. Keep it available for hand continuity, written-release

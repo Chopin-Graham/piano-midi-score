@@ -116,3 +116,81 @@ def test_long_title_uses_smaller_credit_type() -> None:
     root = ET.fromstring(xml)
 
     assert root.find("./credit/credit-words").get("font-size") == "18"
+
+
+def _late_start_midi_bytes(first_onset: int = 1440) -> bytes:
+    from io import BytesIO
+
+    import mido
+
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+    meta = mido.MidiTrack()
+    piano = mido.MidiTrack()
+    midi.tracks.extend([meta, piano])
+    meta.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(96), time=0))
+    meta.append(
+        mido.MetaMessage(
+            "time_signature",
+            numerator=4,
+            denominator=4,
+            clocks_per_click=24,
+            notated_32nd_notes_per_beat=8,
+            time=0,
+        )
+    )
+    notes = [
+        (first_onset, 240, 76),
+        (first_onset + 240, 240, 77),
+        (first_onset + 480, 480, 79),
+        (first_onset + 1440, 480, 48),
+        (first_onset + 2400, 240, 74),
+    ]
+    events: list[tuple[int, int, mido.Message]] = []
+    for onset, duration, pitch in notes:
+        events.append((onset, 1, mido.Message("note_on", note=pitch, velocity=80, channel=0)))
+        events.append(
+            (onset + duration, 0, mido.Message("note_off", note=pitch, velocity=0, channel=0))
+        )
+    events.sort(key=lambda item: (item[0], item[1]))
+    previous = 0
+    for tick, _, message in events:
+        message.time = tick - previous
+        piano.append(message)
+        previous = tick
+    buffer = BytesIO()
+    midi.save(file=buffer)
+    return buffer.getvalue()
+
+
+def test_audio_transcription_reframes_leading_rests_as_pickup() -> None:
+    xml, _, warnings = convert_midi(
+        _late_start_midi_bytes(1440),
+        "pickup.mid",
+        ConversionOptions(audio_transcription=True),
+    )
+    root = ET.fromstring(xml)
+
+    first_measure = root.find("./part/measure")
+    assert first_measure is not None
+    assert first_measure.get("implicit") == "yes"
+    # The pickup bar holds exactly the final beat: one beat of content, no rests.
+    first_measure_durations = [
+        int(node.findtext("duration", "0"))
+        for node in first_measure.findall("note")
+        if node.find("chord") is None
+    ]
+    assert sum(first_measure_durations[:2]) == 480
+    assert any("弱起" in warning for warning in warnings)
+
+
+def test_regular_midi_keeps_full_first_measure_without_pickup_reframe() -> None:
+    xml, _, _ = convert_midi(
+        _late_start_midi_bytes(1440),
+        "pickup.mid",
+        ConversionOptions(),
+    )
+    root = ET.fromstring(xml)
+
+    first_measure = root.find("./part/measure")
+    assert first_measure is not None
+    assert first_measure.get("implicit") != "yes"
