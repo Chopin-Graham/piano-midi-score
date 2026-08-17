@@ -42,6 +42,7 @@ class NotationNote:
     pitch_octave: int | None = None
     hand: Hand | None = None
     arpeggiated: bool = False
+    trill: bool = False
 
 
 @dataclass(slots=True)
@@ -551,6 +552,7 @@ def _notation_atoms(
                     pitch_octave=note.pitch_octave,
                     hand=note.hand,
                     arpeggiated=note.arpeggiated,
+                    trill=note.trill and index == 0,
                 )
             )
     return sorted(atoms, key=lambda atom: (atom.onset, atom.staff, atom.voice, atom.pitch))
@@ -1047,6 +1049,7 @@ def _write_item(
             or item.tuplet_start
             or item.tuplet_stop
             or notation_note.arpeggiated
+            or notation_note.trill
         ):
             notations = ET.SubElement(note_element, "notations")
             if notation_note.tie_stop:
@@ -1059,6 +1062,9 @@ def _write_item(
                 ET.SubElement(notations, "tuplet", type="stop")
             if notation_note.arpeggiated:
                 ET.SubElement(notations, "arpeggiate", number="1")
+            if notation_note.trill:
+                ornaments = ET.SubElement(notations, "ornaments")
+                ET.SubElement(ornaments, "trill-mark")
 
 
 def _write_pitch(

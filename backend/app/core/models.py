@@ -112,6 +112,7 @@ class QuantizedNote:
     pitch_octave: int | None = None
     hand: Hand | None = None
     arpeggiated: bool = False
+    trill: bool = False
 
     @property
     def end(self) -> int:

@@ -30,6 +30,7 @@ from .models import (
 )
 from .musicxml import musicxml_readability_metrics, score_to_musicxml
 from .options import ConversionOptions
+from .ornaments import collapse_trills
 from .quality import evaluate_notation_quality
 from .quantizer import quantize_midi
 from .spelling import apply_pitch_spelling
@@ -147,6 +148,15 @@ def convert_midi_with_score(
             f"依据实际动态谱号，将 {clef_aware_repairs} 个仍会产生极端加线的音移到另一谱表"
         )
     physical_notes = notes
+    trill_count = 0
+    trill_absorbed = 0
+    if options.audio_transcription:
+        notes, trill_count, trill_absorbed = collapse_trills(notes)
+        if trill_count:
+            warnings.append(
+                f"检测到 {trill_count} 处快速二度交替，已按颤音记号书写"
+                f"（合并 {trill_absorbed} 个重复攻击音，总时值不变）"
+            )
     notes, duration_analysis, duration_warnings = simplify_polyphonic_durations(
         notes,
         max_voices=options.max_voices_per_staff,
@@ -263,6 +273,10 @@ def convert_midi_with_score(
         },
         "voices": voice_counts,
         "duration_simplification": duration_analysis,
+        "ornaments": {
+            "trills": trill_count,
+            "trill_absorbed_attacks": trill_absorbed,
+        },
         "spelling": spelling_analysis,
         "notation": notation_analysis,
         "engraving_style": options.engraving_style,
