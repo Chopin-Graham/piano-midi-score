@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MidiOptions>
+  <!-- MuseScore MIDI importer values: 0=quarter, 1=eighth, 2=sixteenth, 3=32nd. -->
+  <QuantValue>2</QuantValue>
+  <!-- Value + 1 voices. Piano engraving is capped at two voices per staff. -->
+  <VoiceCount>1</VoiceCount>
+  <Duplets>false</Duplets>
+  <Triplets>true</Triplets>
+  <Quadruplets>false</Quadruplets>
+  <Quintuplets>false</Quintuplets>
+  <Septuplets>false</Septuplets>
+  <Nonuplets>false</Nonuplets>
+  <HumanPerformance>true</HumanPerformance>
+  <MeasureCount2xLess>false</MeasureCount2xLess>
+  <SplitStaff>true</SplitStaff>
+  <!-- Stable grand-staff clefs are easier to sight-read than frequent local changes. -->
+  <ClefChanges>false</ClefChanges>
+  <SimplifyDurations>true</SimplifyDurations>
+  <ShowStaccato>false</ShowStaccato>
+  <DottedNotes>true</DottedNotes>
+  <RecognizePickupBar>true</RecognizePickupBar>
+  <Swing>0</Swing>
+</MidiOptions>

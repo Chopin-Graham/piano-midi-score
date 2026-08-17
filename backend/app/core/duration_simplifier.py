@@ -1,0 +1,331 @@
+from __future__ import annotations
+
+from bisect import bisect_right
+from collections import defaultdict
+from dataclasses import replace
+
+from .models import (
+    CANONICAL_DIVISIONS,
+    MeasureSpan,
+    PedalEvent,
+    QuantizedNote,
+    Staff,
+)
+from .piano_rules import PedalCoverage
+
+
+def simplify_polyphonic_durations(
+    notes: list[QuantizedNote],
+    *,
+    max_voices: int,
+    style: str,
+    pedals: list[PedalEvent] | None = None,
+    measures: list[MeasureSpan] | None = None,
+    transcription_mode: bool = False,
+) -> tuple[list[QuantizedNote], dict[str, object], list[str]]:
+    """Reduce performance-only overlaps while preserving every note attack.
+
+    A pianist often releases or overlaps keys for legato and pedal colour. Those
+    durations are not independent notated voices. When existing sustained layers
+    leave fewer voice slots than a new onset contains, new notes are snapped to a
+    small set of shared durations. The faithful style deliberately skips this
+    readability normalization.
+    """
+
+    if style == "faithful" or not notes:
+        return (
+            notes,
+            {
+                "adjusted_note_count": 0,
+                "shortened_note_count": 0,
+                "pedal_extended_note_count": 0,
+                "legato_extended_note_count": 0,
+                "transcription_release_extended_note_count": 0,
+                "method": "disabled",
+            },
+            [],
+        )
+
+    notes, pedal_extended, legato_extended = _extend_release_gaps_to_metric_boundaries(
+        notes,
+        pedals or [],
+        measures or [],
+    )
+    transcription_extended = 0
+    if transcription_mode:
+        notes, transcription_extended = _extend_transcription_release_gaps(
+            notes,
+            measures or [],
+            style,
+        )
+    shortened = 0
+    result: list[QuantizedNote] = []
+    for staff in (Staff.RIGHT, Staff.LEFT):
+        staff_notes = sorted(
+            (note for note in notes if note.staff == staff),
+            key=lambda note: (note.onset, note.duration, note.pitch, note.source_id),
+        )
+        by_onset: dict[int, list[int]] = defaultdict(list)
+        for index, note in enumerate(staff_notes):
+            by_onset[note.onset].append(index)
+
+        active_indices: set[int] = set()
+        for onset in sorted(by_onset):
+            active_indices = {
+                index for index in active_indices if staff_notes[index].end > onset
+            }
+            active_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
+            for active_index in active_indices:
+                active_note = staff_notes[active_index]
+                active_groups[(active_note.onset, active_note.duration)].append(active_index)
+
+            if len(active_groups) >= max_voices:
+                keep_count = max(0, max_voices - 1)
+                ranked = sorted(
+                    active_groups,
+                    key=lambda key: _active_importance(
+                        [staff_notes[index] for index in active_groups[key]],
+                        staff,
+                    ),
+                    reverse=True,
+                )
+                keep = set(ranked[:keep_count])
+                shortened_indices: set[int] = set()
+                for key, active_group_indices in active_groups.items():
+                    if key in keep:
+                        continue
+                    for active_index in active_group_indices:
+                        note = staff_notes[active_index]
+                        target = onset - note.onset
+                        if 0 < target < note.duration:
+                            staff_notes[active_index] = replace(note, duration=target)
+                            shortened += 1
+                            shortened_indices.add(active_index)
+                active_indices.difference_update(shortened_indices)
+
+            active_layers = {
+                (staff_notes[index].onset, staff_notes[index].duration)
+                for index in active_indices
+            }
+            indices = by_onset[onset]
+            durations = sorted({staff_notes[index].duration for index in indices})
+            allowed_new_layers = max(1, max_voices - len(active_layers))
+            if len(durations) <= allowed_new_layers:
+                active_indices.update(indices)
+                continue
+
+            targets = _duration_targets(durations, allowed_new_layers)
+            for index in indices:
+                note = staff_notes[index]
+                target = min(targets, key=lambda value: (abs(value - note.duration), value))
+                if target != note.duration:
+                    staff_notes[index] = replace(note, duration=target)
+                    shortened += 1
+            active_indices.update(indices)
+        result.extend(staff_notes)
+
+    warnings = []
+    if pedal_extended:
+        warnings.append(
+            f"踏板已覆盖松键空隙，已将 {pedal_extended} 个长音延至相邻强拍或小节边界，消除碎休止符"
+        )
+    if legato_extended:
+        warnings.append(
+            f"已将 {legato_extended} 个跨至少两个强拍、且仅提前十六分音符松键的长音对齐到边界"
+        )
+    if transcription_extended:
+        warnings.append(
+            f"音频转录的按键释放较碎，已将 {transcription_extended} 个短释放间隙延至下一起音或节拍边界（起音全部保留）"
+        )
+    if shortened:
+        warnings.append(
+            f"为消除演奏型重叠并保持最多 {max_voices} 层清晰声部，已规范化 {shortened} 个音符时值（音头全部保留）"
+        )
+    adjusted = pedal_extended + legato_extended + transcription_extended + shortened
+    return (
+        sorted(result, key=lambda note: (note.onset, note.pitch, note.source_id)),
+        {
+            "adjusted_note_count": adjusted,
+            "shortened_note_count": shortened,
+            "pedal_extended_note_count": pedal_extended,
+            "legato_extended_note_count": legato_extended,
+            "transcription_release_extended_note_count": transcription_extended,
+            "method": "transcription_aware_shared_onset_duration_reduction",
+        },
+        warnings,
+    )
+
+
+def _extend_transcription_release_gaps(
+    notes: list[QuantizedNote],
+    measures: list[MeasureSpan],
+    style: str,
+) -> tuple[list[QuantizedNote], int]:
+    """Infer conventional written releases from noisy audio offsets.
+
+    Audio models estimate attacks much more reliably than key releases. In
+    clean/balanced output, a sixteenth-note-or-smaller silence immediately
+    before the next staff attack or metric boundary is normally articulation,
+    not a request for another printed rest. Extending the written copy closes
+    that gap without moving or deleting any attack; physical review still uses
+    the untouched notes captured earlier in the pipeline.
+    """
+
+    if not notes:
+        return notes, 0
+
+    maximum_gap = CANONICAL_DIVISIONS // (4 if style == "clean" else 8)
+    onsets_by_staff: dict[Staff, list[int]] = defaultdict(list)
+    for note in notes:
+        if note.staff is not None:
+            onsets_by_staff[note.staff].append(note.onset)
+    for staff in onsets_by_staff:
+        onsets_by_staff[staff] = sorted(set(onsets_by_staff[staff]))
+
+    extended = 0
+    result: list[QuantizedNote] = []
+    for note in notes:
+        if note.staff is None:
+            result.append(note)
+            continue
+        later_onsets = onsets_by_staff[note.staff]
+        next_index = bisect_right(later_onsets, note.onset)
+        next_onset = (
+            later_onsets[next_index] if next_index < len(later_onsets) else None
+        )
+        boundary, _ = _next_metric_boundary(note.end, measures)
+        targets = [
+            target
+            for target in (next_onset, boundary)
+            if target is not None and target > note.end
+        ]
+        if not targets:
+            result.append(note)
+            continue
+        target = min(targets)
+        gap = target - note.end
+        if gap > maximum_gap:
+            result.append(note)
+            continue
+        result.append(replace(note, duration=target - note.onset))
+        extended += 1
+    return result, extended
+
+
+def _extend_release_gaps_to_metric_boundaries(
+    notes: list[QuantizedNote],
+    pedals: list[PedalEvent],
+    measures: list[MeasureSpan],
+) -> tuple[list[QuantizedNote], int, int]:
+    """Remove tiny release gaps that do not deserve a printed rest.
+
+    A key-up shortly before a strong metric boundary is performance articulation,
+    not a request for a printed sixteenth rest, when either the pedal carries the
+    sound or a metrically aligned note already spans two strong beats.  Extending
+    only the written copy produces conventional long notes while the untouched
+    pre-normalization notes remain available for physical playability checks.
+    """
+
+    if not notes or not measures:
+        return notes, 0, 0
+
+    coverage = PedalCoverage(pedals)
+    maximum_gap = CANONICAL_DIVISIONS // 4
+    onsets_by_staff: dict[Staff, set[int]] = defaultdict(set)
+    next_same_pitch: dict[int, int | None] = {}
+    by_pitch: dict[tuple[int, int], list[QuantizedNote]] = defaultdict(list)
+    for note in notes:
+        if note.staff is not None:
+            onsets_by_staff[note.staff].add(note.onset)
+        by_pitch[(note.channel, note.pitch)].append(note)
+    for pitch_notes in by_pitch.values():
+        ordered = sorted(pitch_notes, key=lambda note: (note.onset, note.end, note.source_id))
+        for index, note in enumerate(ordered):
+            next_same_pitch[note.source_id] = (
+                ordered[index + 1].onset if index + 1 < len(ordered) else None
+            )
+
+    pedal_extended = 0
+    legato_extended = 0
+    result: list[QuantizedNote] = []
+    for note in notes:
+        boundary, group_length = _next_metric_boundary(note.end, measures)
+        gap = boundary - note.end if boundary is not None else 0
+        pedal_carries_gap = (
+            boundary is not None
+            and coverage.covers(note.channel, note.end, boundary)
+        )
+        long_metric_legato = (
+            boundary is not None
+            and note.duration >= group_length * 2
+            and _is_metric_boundary(note.onset, measures)
+        )
+        if (
+            note.staff is None
+            or boundary is None
+            or not 0 < gap <= maximum_gap
+            or note.duration < group_length
+            or not (pedal_carries_gap or long_metric_legato)
+            or any(
+                note.end <= onset < boundary
+                for onset in onsets_by_staff[note.staff]
+            )
+            or (
+                next_same_pitch.get(note.source_id) is not None
+                and next_same_pitch[note.source_id] < boundary
+            )
+        ):
+            result.append(note)
+            continue
+        result.append(replace(note, duration=boundary - note.onset))
+        if pedal_carries_gap:
+            pedal_extended += 1
+        else:
+            legato_extended += 1
+    return result, pedal_extended, legato_extended
+
+
+def _next_metric_boundary(
+    tick: int,
+    measures: list[MeasureSpan],
+) -> tuple[int | None, int]:
+    for measure in measures:
+        if not measure.start <= tick < measure.end:
+            continue
+        relative = tick - measure.start
+        previous = 0
+        for boundary in measure.meter.beat_group_boundaries[1:]:
+            if boundary > relative:
+                return measure.start + boundary, boundary - previous
+            previous = boundary
+        return measure.end, measure.duration
+    return None, CANONICAL_DIVISIONS
+
+
+def _is_metric_boundary(tick: int, measures: list[MeasureSpan]) -> bool:
+    for measure in measures:
+        if not measure.start <= tick <= measure.end:
+            continue
+        relative = tick - measure.start
+        return relative in measure.meter.beat_group_boundaries
+    return False
+
+
+def _duration_targets(durations: list[int], allowed: int) -> list[int]:
+    if allowed <= 1:
+        return [durations[0]]
+    if allowed >= len(durations):
+        return durations
+    if allowed == 2:
+        return [durations[0], durations[-1]]
+    return [
+        durations[round(index * (len(durations) - 1) / (allowed - 1))]
+        for index in range(allowed)
+    ]
+
+
+def _active_importance(notes: list[QuantizedNote], staff: Staff) -> float:
+    duration = max(note.duration for note in notes)
+    center = sum(note.pitch for note in notes) / len(notes)
+    register = center if staff == Staff.RIGHT else -center
+    return duration + register * 2.0

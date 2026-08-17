@@ -1,0 +1,24 @@
+{
+  "name": "piano-midi-score-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "npm run typecheck && node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.app.json",
+    "test": "tsx --test src/lib/format.test.ts src/lib/files.test.ts"
+  },
+  "dependencies": {
+    "opensheetmusicdisplay": "2.1.2",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.18",
+    "@types/react-dom": "18.3.5",
+    "esbuild": "0.28.2",
+    "tsx": "4.23.12",
+    "typescript": "5.7.3",
+    "@types/node": "20.17.19"
+  }
+}

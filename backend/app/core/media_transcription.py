@@ -1,0 +1,987 @@
+from __future__ import annotations
+
+import bisect
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import wave
+from collections.abc import Callable
+from dataclasses import dataclass
+from functools import lru_cache
+from io import BytesIO
+from math import log2
+from pathlib import Path
+from statistics import median
+
+import mido
+
+from .models import CANONICAL_DIVISIONS
+from .options import TranscriptionOptions
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+MEDIA_EXTENSIONS = {
+    ".aac",
+    ".flac",
+    ".m4a",
+    ".mkv",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".webm",
+}
+FFMPEG_ENV = "PIANO_MIDI_SCORE_FFMPEG"
+AUDIO_PYTHON_ENV = "PIANO_MIDI_SCORE_AUDIO_PYTHON"
+TRANSCRIPTION_TIMEOUT_SECONDS = 60 * 60
+
+
+class MediaTranscriptionError(ValueError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class MediaTranscriptionResult:
+    midi_bytes: bytes
+    raw_midi_bytes: bytes
+    analysis: dict[str, object]
+    warnings: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _TimedNote:
+    pitch: int
+    start: float
+    end: float
+    velocity: int
+
+
+@dataclass(frozen=True, slots=True)
+class _TimedPedal:
+    time: float
+    down: bool
+
+
+def transcribe_media(
+    data: bytes,
+    filename: str,
+    options: TranscriptionOptions | None = None,
+) -> MediaTranscriptionResult:
+    options = options or TranscriptionOptions()
+    extension = Path(filename).suffix.lower()
+    if extension not in MEDIA_EXTENSIONS:
+        raise MediaTranscriptionError(f"Unsupported audio/video extension: {extension or '(none)'}")
+    if not data:
+        raise MediaTranscriptionError("The uploaded media file is empty")
+
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is None:
+        raise MediaTranscriptionError(
+            "FFmpeg was not found; install FFmpeg or set PIANO_MIDI_SCORE_FFMPEG"
+        )
+    audio_python = find_audio_python()
+    backend = _select_backend(options.backend, audio_python)
+    device = _select_device(options.device, backend, audio_python)
+    warnings: list[str] = []
+    started = time.perf_counter()
+
+    with tempfile.TemporaryDirectory(prefix="piano-media-transcription-") as temporary:
+        workdir = Path(temporary)
+        source_path = workdir / f"source{extension}"
+        audio_path = workdir / "piano-mono-44100.wav"
+        raw_midi_path = workdir / "raw-transcription.mid"
+        source_path.write_bytes(data)
+        _prepare_audio(ffmpeg, source_path, audio_path)
+        duration_seconds = _wav_duration(audio_path)
+
+        _run_backend(
+            backend,
+            audio_python,
+            audio_path,
+            raw_midi_path,
+            device,
+            options,
+        )
+        raw_midi_bytes = raw_midi_path.read_bytes()
+        if not raw_midi_bytes.startswith(b"MThd"):
+            raise MediaTranscriptionError(f"{backend} did not produce a valid MIDI file")
+
+        beat_times: list[float] = []
+        beat_tempo: float | None = None
+        if options.align_beats:
+            try:
+                beat_times, beat_tempo = _estimate_beats(audio_python, audio_path, workdir)
+            except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                warnings.append(
+                    f"Beat alignment was unavailable ({exc}); retained a constant-tempo MIDI timeline"
+                )
+
+        midi_bytes, postprocess, postprocess_warnings = _postprocess_midi(
+            raw_midi_bytes,
+            beat_times,
+            options.minimum_note_ms,
+            backend,
+        )
+        warnings.extend(postprocess_warnings)
+
+    analysis = {
+        "backend": backend,
+        "device": device,
+        "audio_python": str(audio_python),
+        "ffmpeg": str(ffmpeg),
+        "source_extension": extension,
+        "source_bytes": len(data),
+        "duration_seconds": round(duration_seconds, 3),
+        "beat_detection": bool(beat_times),
+        "beat_alignment": postprocess["alignment_method"]
+        == "librosa_dynamic_beat_warp",
+        "beat_count": len(beat_times),
+        "detected_beat_tempo_bpm": (
+            round(beat_tempo, 3) if beat_tempo is not None else None
+        ),
+        "estimated_tempo_bpm": postprocess["tempo_bpm"],
+        "processing_ms": round((time.perf_counter() - started) * 1000, 2),
+        **postprocess,
+    }
+    return MediaTranscriptionResult(
+        midi_bytes=midi_bytes,
+        raw_midi_bytes=raw_midi_bytes,
+        analysis=analysis,
+        warnings=list(dict.fromkeys(warnings)),
+    )
+
+
+@lru_cache(maxsize=1)
+def find_ffmpeg() -> Path | None:
+    configured = os.environ.get(FFMPEG_ENV)
+    candidates = [
+        configured,
+        shutil.which("ffmpeg"),
+        (
+            Path.home()
+            / "AppData/Local/Microsoft/WinGet/Packages"
+            / "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
+            / "ffmpeg-8.1.2-full_build/bin/ffmpeg.exe"
+        ),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if path.is_file():
+            return path.resolve()
+    return None
+
+
+@lru_cache(maxsize=1)
+def find_audio_python() -> Path:
+    configured = os.environ.get(AUDIO_PYTHON_ENV)
+    candidates = [
+        configured,
+        PROJECT_ROOT / ".venv-audio/Scripts/python.exe",
+        sys.executable,
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if path.is_file():
+            return path.resolve()
+    return Path(sys.executable).resolve()
+
+
+@lru_cache(maxsize=1)
+def transcription_status() -> dict[str, object]:
+    ffmpeg = find_ffmpeg()
+    audio_python = find_audio_python()
+    transkun = _python_module_available(audio_python, "transkun")
+    basic_pitch = _python_module_available(audio_python, "basic_pitch")
+    return {
+        "available": ffmpeg is not None and (transkun or basic_pitch),
+        "ffmpeg": str(ffmpeg) if ffmpeg else None,
+        "audio_python": str(audio_python),
+        "preferred_backend": "transkun" if transkun else "basic_pitch" if basic_pitch else None,
+        "backends": {
+            "transkun": {
+                "available": transkun,
+                "purpose": "piano-specific expressive transcription",
+                "license": "MIT",
+            },
+            "basic_pitch": {
+                "available": basic_pitch,
+                "purpose": "lightweight cross-platform fallback",
+                "license": "Apache-2.0",
+            },
+        },
+    }
+
+
+def _python_module_available(python: Path, module: str) -> bool:
+    if python == Path(sys.executable).resolve():
+        return importlib.util.find_spec(module) is not None
+    completed = subprocess.run(
+        [
+            str(python),
+            "-c",
+            f"import importlib.util; raise SystemExit(0 if importlib.util.find_spec('{module}') else 1)",
+        ],
+        check=False,
+        capture_output=True,
+        timeout=20,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    return completed.returncode == 0
+
+
+def _select_backend(requested: str, audio_python: Path) -> str:
+    available = {
+        "transkun": _python_module_available(audio_python, "transkun"),
+        "basic_pitch": _python_module_available(audio_python, "basic_pitch"),
+    }
+    if requested != "auto":
+        if not available[requested]:
+            raise MediaTranscriptionError(
+                f"Requested transcription backend '{requested}' is not installed in {audio_python}"
+            )
+        return requested
+    for candidate in ("transkun", "basic_pitch"):
+        if available[candidate]:
+            return candidate
+    raise MediaTranscriptionError(
+        "No transcription backend is installed; install the audio-transkun or audio-basic-pitch extra"
+    )
+
+
+def _select_device(requested: str, backend: str, audio_python: Path) -> str:
+    if backend == "basic_pitch":
+        return "cpu"
+    cuda_available = _torch_cuda_available(audio_python)
+    if requested == "cuda" and not cuda_available:
+        raise MediaTranscriptionError("CUDA was requested but is not available to the audio Python")
+    if requested == "cpu":
+        return "cpu"
+    return "cuda" if cuda_available else "cpu"
+
+
+def _torch_cuda_available(audio_python: Path) -> bool:
+    completed = subprocess.run(
+        [
+            str(audio_python),
+            "-c",
+            "import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)",
+        ],
+        check=False,
+        capture_output=True,
+        timeout=30,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    return completed.returncode == 0
+
+
+def _prepare_audio(ffmpeg: Path, source_path: Path, audio_path: Path) -> None:
+    command = [
+        str(ffmpeg),
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(source_path),
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "44100",
+        "-c:a",
+        "pcm_s16le",
+        str(audio_path),
+    ]
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=600,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if completed.returncode != 0 or not audio_path.is_file():
+        detail = (completed.stderr or completed.stdout or "unknown FFmpeg error").strip()
+        raise MediaTranscriptionError(f"FFmpeg could not extract audio: {detail[:500]}")
+
+
+def _wav_duration(path: Path) -> float:
+    with wave.open(str(path), "rb") as stream:
+        return stream.getnframes() / stream.getframerate()
+
+
+def _run_backend(
+    backend: str,
+    audio_python: Path,
+    audio_path: Path,
+    raw_midi_path: Path,
+    device: str,
+    options: TranscriptionOptions,
+) -> None:
+    if backend == "transkun":
+        command = [
+            str(audio_python),
+            "-m",
+            "transkun.transcribe",
+            str(audio_path),
+            str(raw_midi_path),
+            "--device",
+            device,
+        ]
+        output_dir = None
+    else:
+        output_dir = raw_midi_path.parent / "basic-pitch-output"
+        output_dir.mkdir()
+        command = [
+            str(audio_python),
+            "-m",
+            "basic_pitch.predict",
+            str(output_dir),
+            str(audio_path),
+            "--model-serialization",
+            "onnx",
+            "--onset-threshold",
+            str(options.onset_threshold),
+            "--frame-threshold",
+            str(options.frame_threshold),
+            "--minimum-note-length",
+            str(options.minimum_note_ms),
+            "--minimum-frequency",
+            "27.5",
+            "--maximum-frequency",
+            "4186.01",
+        ]
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=TRANSCRIPTION_TIMEOUT_SECONDS,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "unknown backend error").strip()
+        raise MediaTranscriptionError(f"{backend} transcription failed: {detail[-1500:]}")
+    if output_dir is not None:
+        candidates = sorted(output_dir.glob("*.mid")) + sorted(output_dir.glob("*.midi"))
+        if not candidates:
+            raise MediaTranscriptionError("Basic Pitch completed without a MIDI output")
+        shutil.copyfile(candidates[0], raw_midi_path)
+    if not raw_midi_path.is_file():
+        raise MediaTranscriptionError(f"{backend} completed without a MIDI output")
+
+
+def _estimate_beats(
+    audio_python: Path,
+    audio_path: Path,
+    workdir: Path,
+) -> tuple[list[float], float | None]:
+    output = workdir / "beats.json"
+    worker = PROJECT_ROOT / "backend/app/audio_worker.py"
+    completed = subprocess.run(
+        [str(audio_python), str(worker), "beats", str(audio_path), str(output)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=900,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if completed.returncode != 0 or not output.is_file():
+        detail = (completed.stderr or completed.stdout or "beat worker failed").strip()
+        raise RuntimeError(detail[-800:])
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    beats = sorted({float(value) for value in payload.get("beat_times", []) if value >= 0})
+    if len(beats) < 4:
+        raise ValueError("fewer than four reliable beats were detected")
+    return beats, float(payload.get("tempo_bpm", 0.0)) or None
+
+
+def _postprocess_midi(
+    raw_midi_bytes: bytes,
+    beat_times: list[float],
+    minimum_note_ms: float,
+    backend: str,
+) -> tuple[bytes, dict[str, object], list[str]]:
+    notes, pedals, source_tempo = _timed_events(raw_midi_bytes)
+    cleaned, cleaning = _clean_notes(notes, minimum_note_ms / 1000)
+    if not cleaned:
+        raise MediaTranscriptionError("The transcription contained no usable piano notes")
+
+    aligned, attack_analysis = _align_attack_columns(cleaned)
+    mapper, tempo_bpm, alignment_method, tempo_analysis = _select_timeline_mapper(
+        beat_times,
+        aligned,
+        source_tempo,
+    )
+
+    midi_bytes = _write_aligned_midi(aligned, pedals, mapper, tempo_bpm, backend)
+    duration = max(note.end for note in aligned)
+    warnings: list[str] = []
+    note_density = len(aligned) / max(duration, 1.0)
+    if note_density > 18:
+        warnings.append(
+            f"The transcription is unusually dense ({note_density:.1f} notes/s); review for false positives"
+        )
+    if beat_times and alignment_method != "librosa_dynamic_beat_warp":
+        warnings.append(
+            "The detected beat grid did not improve the transcription attack alignment; "
+            f"used a stable {tempo_bpm:.1f} BPM timeline instead"
+        )
+    if cleaning["removed_short_notes"] > max(20, round(len(notes) * 0.08)):
+        warnings.append(
+            f"Removed {cleaning['removed_short_notes']} sub-frame or very low-velocity artifacts"
+        )
+    return (
+        midi_bytes,
+        {
+            "raw_note_count": len(notes),
+            "clean_note_count": len(aligned),
+            "pitch_min": min(note.pitch for note in aligned),
+            "pitch_max": max(note.pitch for note in aligned),
+            "tempo_bpm": round(tempo_bpm, 3),
+            "alignment_method": alignment_method,
+            **cleaning,
+            **attack_analysis,
+            **tempo_analysis,
+        },
+        warnings,
+    )
+
+
+def _timed_events(raw_midi_bytes: bytes) -> tuple[list[_TimedNote], list[_TimedPedal], float]:
+    midi = mido.MidiFile(file=BytesIO(raw_midi_bytes))
+    tempo = 500_000
+    initial_tempo = tempo
+    seconds = 0.0
+    active: dict[tuple[int, int], list[tuple[float, int]]] = {}
+    notes: list[_TimedNote] = []
+    pedals: list[_TimedPedal] = []
+    for message in mido.merge_tracks(midi.tracks):
+        seconds += mido.tick2second(message.time, midi.ticks_per_beat, tempo)
+        if message.is_meta and message.type == "set_tempo":
+            tempo = int(message.tempo)
+            if not notes:
+                initial_tempo = tempo
+            continue
+        if message.is_meta:
+            continue
+        if message.type == "note_on" and message.velocity > 0:
+            active.setdefault((message.channel, message.note), []).append(
+                (seconds, int(message.velocity))
+            )
+        elif message.type in {"note_off", "note_on"}:
+            stack = active.get((message.channel, message.note), [])
+            if not stack:
+                continue
+            start, velocity = stack.pop(0)
+            if seconds > start:
+                notes.append(_TimedNote(message.note, start, seconds, velocity))
+        elif message.type == "control_change" and message.control == 64:
+            pedals.append(_TimedPedal(seconds, message.value >= 64))
+    return notes, pedals, mido.tempo2bpm(initial_tempo)
+
+
+def _clean_notes(
+    notes: list[_TimedNote],
+    minimum_seconds: float,
+) -> tuple[list[_TimedNote], dict[str, int]]:
+    removed_out_of_range = sum(not 21 <= note.pitch <= 108 for note in notes)
+    in_range = [note for note in notes if 21 <= note.pitch <= 108]
+    hard_artifact_floor = min(0.020, minimum_seconds * 0.45)
+    removed_short = 0
+    normalized_short = 0
+    candidates: list[_TimedNote] = []
+    for note in in_range:
+        duration = note.end - note.start
+        # Transcription offset estimates are much less reliable than attacks. A
+        # strong 30–50 ms staccato can be a real note, especially in virtuoso
+        # piano, so preserve its onset and only normalize the release. Delete
+        # only sub-frame blips or extremely soft short detections.
+        if duration < hard_artifact_floor or (
+            duration < minimum_seconds and note.velocity <= 32
+        ):
+            removed_short += 1
+            continue
+        if duration < minimum_seconds:
+            candidates.append(
+                _TimedNote(
+                    pitch=note.pitch,
+                    start=note.start,
+                    end=note.start + minimum_seconds,
+                    velocity=note.velocity,
+                )
+            )
+            normalized_short += 1
+            continue
+        candidates.append(note)
+
+    deduplicated: list[_TimedNote] = []
+    duplicate_count = 0
+    for note in sorted(candidates, key=lambda item: (item.pitch, item.start, item.end)):
+        if (
+            deduplicated
+            and deduplicated[-1].pitch == note.pitch
+            and abs(deduplicated[-1].start - note.start)
+            <= max(0.025, minimum_seconds * 0.75)
+        ):
+            previous = deduplicated[-1]
+            deduplicated[-1] = _TimedNote(
+                pitch=note.pitch,
+                start=min(previous.start, note.start),
+                end=max(previous.end, note.end),
+                velocity=max(previous.velocity, note.velocity),
+            )
+            duplicate_count += 1
+        else:
+            deduplicated.append(note)
+
+    by_pitch: dict[int, list[_TimedNote]] = {}
+    for note in deduplicated:
+        by_pitch.setdefault(note.pitch, []).append(note)
+    result: list[_TimedNote] = []
+    overlap_repairs = 0
+    for pitch_notes in by_pitch.values():
+        previous: _TimedNote | None = None
+        for note in pitch_notes:
+            if previous is not None and note.start < previous.end:
+                if note.start - previous.start < minimum_seconds:
+                    merged = _TimedNote(
+                        previous.pitch,
+                        previous.start,
+                        max(previous.end, note.end),
+                        max(previous.velocity, note.velocity),
+                    )
+                    result[-1] = merged
+                    previous = merged
+                    overlap_repairs += 1
+                    continue
+                shortened_end = note.start - 0.005
+                result[-1] = _TimedNote(
+                    previous.pitch,
+                    previous.start,
+                    shortened_end,
+                    previous.velocity,
+                )
+                overlap_repairs += 1
+            result.append(note)
+            previous = note
+    return (
+        sorted(result, key=lambda item: (item.start, item.pitch, item.end)),
+        {
+            "removed_out_of_range_notes": removed_out_of_range,
+            "removed_short_notes": removed_short,
+            "normalized_short_notes": normalized_short,
+            "merged_duplicate_notes": duplicate_count,
+            "same_pitch_overlap_repairs": overlap_repairs,
+        },
+    )
+
+
+def _align_attack_columns(
+    notes: list[_TimedNote],
+    window_seconds: float = 0.060,
+) -> tuple[list[_TimedNote], dict[str, int | float]]:
+    """Collapse transcription onset jitter without flattening real arpeggios.
+
+    The legacy Just Music rearranger grouped neighbouring attacks recursively,
+    which could turn a long arpeggio into one chord. Here every column is capped
+    relative to its first attack. Notes move as complete gestures, preserving
+    their original durations instead of extending releases into extra voices.
+    """
+
+    if not notes:
+        return [], {
+            "attack_window_ms": round(window_seconds * 1000, 3),
+            "attack_columns_before": 0,
+            "attack_columns_after": 0,
+            "aligned_attack_notes": 0,
+            "merged_duplicate_attacks": 0,
+        }
+
+    ordered = sorted(notes, key=lambda note: (note.start, note.pitch, note.end))
+    before = len({round(note.start, 6) for note in ordered})
+    aligned: list[_TimedNote] = []
+    shifted = 0
+    duplicates = 0
+    index = 0
+    columns = 0
+    while index < len(ordered):
+        anchor = ordered[index].start
+        stop = index + 1
+        while (
+            stop < len(ordered)
+            and ordered[stop].start - anchor <= window_seconds
+        ):
+            stop += 1
+
+        by_pitch: dict[int, _TimedNote] = {}
+        for note in ordered[index:stop]:
+            duration = note.end - note.start
+            if note.start != anchor:
+                shifted += 1
+            moved = _TimedNote(
+                pitch=note.pitch,
+                start=anchor,
+                end=anchor + duration,
+                velocity=note.velocity,
+            )
+            previous = by_pitch.get(note.pitch)
+            if previous is None:
+                by_pitch[note.pitch] = moved
+            else:
+                by_pitch[note.pitch] = _TimedNote(
+                    pitch=note.pitch,
+                    start=anchor,
+                    end=max(previous.end, moved.end),
+                    velocity=max(previous.velocity, moved.velocity),
+                )
+                duplicates += 1
+        aligned.extend(by_pitch.values())
+        columns += 1
+        index = stop
+
+    return (
+        sorted(aligned, key=lambda note: (note.start, note.pitch, note.end)),
+        {
+            "attack_window_ms": round(window_seconds * 1000, 3),
+            "attack_columns_before": before,
+            "attack_columns_after": columns,
+            "aligned_attack_notes": shifted,
+            "merged_duplicate_attacks": duplicates,
+        },
+    )
+
+
+def _select_timeline_mapper(
+    beat_times: list[float],
+    notes: list[_TimedNote],
+    source_tempo: float,
+) -> tuple[Callable[[float], float], float, str, dict[str, object]]:
+    """Choose the beat layer whose rhythmic grid best matches note attacks.
+
+    Beat trackers often lock to eighth-note accompaniment instead of the
+    notated quarter note, while dense note intervals can produce a false fast
+    tempo. We compare those hypotheses against the source MIDI tempo and keep a
+    small source prior so a marginal estimate cannot rewrite the whole score.
+    """
+
+    source_tempo = max(40.0, min(220.0, source_tempo))
+    attack_times = sorted({round(note.start, 6) for note in notes})
+    candidates: list[tuple[str, float, Callable[[float], float], bool]] = []
+    constant_tempos: list[tuple[str, float]] = [
+        ("constant_tempo_source", source_tempo),
+        ("constant_tempo_notes", _estimate_note_tempo(notes, source_tempo)),
+    ]
+    if len(beat_times) >= 2:
+        dynamic_mapper, beat_tempo = _beat_mapper(beat_times, notes)
+        candidates.append(
+            ("librosa_dynamic_beat_warp", beat_tempo, dynamic_mapper, True)
+        )
+        constant_tempos.append(("constant_tempo_beats", beat_tempo))
+        if beat_tempo / 2 >= 40:
+            constant_tempos.append(("constant_tempo_beats_half", beat_tempo / 2))
+        if beat_tempo * 2 <= 220:
+            constant_tempos.append(("constant_tempo_beats_double", beat_tempo * 2))
+
+    seen_tempos: list[float] = []
+    for method, tempo in constant_tempos:
+        tempo = max(40.0, min(220.0, tempo))
+        if any(abs(tempo - previous) < 0.5 for previous in seen_tempos):
+            continue
+        seen_tempos.append(tempo)
+        candidates.append(
+            (
+                method,
+                tempo,
+                lambda seconds, current=tempo: seconds * current / 60,
+                False,
+            )
+        )
+
+    scored: list[dict[str, object]] = []
+    selected_mappers: dict[str, Callable[[float], float]] = {}
+    for method, tempo, base_mapper, dynamic in candidates:
+        phase, grid_name, grid_error, hit_rate, rhythm_score = _best_rhythm_phase(
+            base_mapper,
+            attack_times,
+            preserve_origin=method == "constant_tempo_source",
+        )
+        def mapper(
+            seconds: float,
+            base: Callable[[float], float] = base_mapper,
+            offset: float = phase,
+        ) -> float:
+            return max(0.0, base(seconds) - offset)
+
+        positions = [mapper(value) for value in attack_times]
+        duration_quarters = max(1.0, max(positions) - min(positions))
+        columns_per_quarter = len(positions) / duration_quarters
+        density_penalty = 0.0
+        if columns_per_quarter > 4.5:
+            density_penalty += (columns_per_quarter - 4.5) * 0.02
+        elif columns_per_quarter < 0.65:
+            density_penalty += (0.65 - columns_per_quarter) * 0.02
+        source_prior = abs(log2(tempo / source_tempo)) * 0.04
+        dynamic_penalty = 0.003 if dynamic else 0.0
+        total_score = rhythm_score + density_penalty + source_prior + dynamic_penalty
+        selected_mappers[method] = mapper
+        scored.append(
+            {
+                "method": method,
+                "tempo_bpm": round(tempo, 3),
+                "phase_quarters": round(phase, 5),
+                "grid": grid_name,
+                "grid_error": round(grid_error, 5),
+                "grid_hit_rate": round(hit_rate, 4),
+                "attack_columns_per_quarter": round(columns_per_quarter, 4),
+                "score": round(total_score, 6),
+            }
+        )
+
+    best = min(scored, key=lambda item: float(item["score"]))
+    source_candidate = next(
+        item for item in scored if item["method"] == "constant_tempo_source"
+    )
+    # Prefer a stable source timeline when another hypothesis is only a
+    # statistical tie. This is especially important for Transkun's dense
+    # accompaniment output, where interval histograms often overestimate BPM.
+    if (
+        float(source_candidate["grid_error"]) <= 0.065
+        and float(source_candidate["grid_hit_rate"]) >= 0.40
+    ):
+        best = source_candidate
+        selection_reason = "source_grid_already_readable"
+    elif float(source_candidate["score"]) <= float(best["score"]) + 0.003:
+        best = source_candidate
+        selection_reason = "source_statistical_tie"
+    else:
+        selection_reason = "best_rhythm_alignment"
+
+    selected_method = str(best["method"])
+    selected_tempo = float(best["tempo_bpm"])
+    for item in scored:
+        item["selected"] = item is best
+    return (
+        selected_mappers[selected_method],
+        selected_tempo,
+        selected_method,
+        {
+            "source_tempo_bpm": round(source_tempo, 3),
+            "tempo_selection_reason": selection_reason,
+            "tempo_candidates": sorted(scored, key=lambda item: float(item["score"])),
+        },
+    )
+
+
+def _best_rhythm_phase(
+    mapper: Callable[[float], float],
+    attack_times: list[float],
+    *,
+    preserve_origin: bool = False,
+) -> tuple[float, str, float, float, float]:
+    positions = [mapper(value) for value in attack_times]
+    phase_candidates = [0.0]
+    if not preserve_origin:
+        phase_candidates = sorted(
+            {
+                0.0,
+                *(index * 0.25 / 48 for index in range(48)),
+                *(index * (1 / 3) / 48 for index in range(48)),
+            }
+        )
+    best: tuple[float, float, str, float, float] | None = None
+    for phase in phase_candidates:
+        shifted = [position - phase for position in positions]
+        sixteenth_errors = [
+            abs(position - round(position / 0.25) * 0.25)
+            for position in shifted
+        ]
+        triplet_step = 1 / 3
+        triplet_errors = [
+            abs(position - round(position / triplet_step) * triplet_step)
+            for position in shifted
+        ]
+        sixteenth_error = median(sixteenth_errors)
+        triplet_error = median(triplet_errors)
+        sixteenth_hit = sum(error <= 0.055 for error in sixteenth_errors) / len(
+            sixteenth_errors
+        )
+        triplet_hit = sum(error <= 0.055 for error in triplet_errors) / len(
+            triplet_errors
+        )
+        sixteenth_score = sixteenth_error + (1 - sixteenth_hit) * 0.015
+        triplet_score = triplet_error + 0.006 + (1 - triplet_hit) * 0.015
+        if sixteenth_score <= triplet_score:
+            candidate = (
+                sixteenth_score,
+                phase,
+                "sixteenth",
+                sixteenth_error,
+                sixteenth_hit,
+            )
+        else:
+            candidate = (
+                triplet_score,
+                phase,
+                "eighth_triplet",
+                triplet_error,
+                triplet_hit,
+            )
+        if best is None or candidate < best:
+            best = candidate
+
+    assert best is not None
+    score, phase, grid_name, error, hit_rate = best
+    return phase, grid_name, error, hit_rate, score
+
+
+def _beat_mapper(
+    beat_times: list[float],
+    notes: list[_TimedNote],
+):
+    periods = [
+        right - left
+        for left, right in zip(beat_times, beat_times[1:], strict=False)
+        if right > left
+    ]
+    period = median(periods)
+    earliest = min(note.start for note in notes)
+    latest = max(note.end for note in notes)
+    extended = list(beat_times)
+    while extended[0] > earliest:
+        extended.insert(0, extended[0] - period)
+    while extended[-1] < latest:
+        extended.append(extended[-1] + period)
+    origin = max(0, bisect.bisect_right(extended, earliest) - 1)
+
+    def mapper(seconds: float) -> float:
+        index = bisect.bisect_right(extended, seconds) - 1
+        index = max(0, min(index, len(extended) - 2))
+        left = extended[index]
+        right = extended[index + 1]
+        fraction = 0.0 if right <= left else (seconds - left) / (right - left)
+        return max(0.0, index - origin + fraction)
+
+    return mapper, 60 / period
+
+
+def _estimate_note_tempo(notes: list[_TimedNote], source_tempo: float) -> float:
+    onsets = sorted({round(note.start, 4) for note in notes})
+    intervals = [
+        right - left
+        for left, right in zip(onsets, onsets[1:], strict=False)
+        if 0.08 <= right - left <= 1.5
+    ]
+    if not intervals:
+        return max(40.0, min(220.0, source_tempo))
+    normalized: list[float] = []
+    for interval in intervals:
+        while interval < 0.30:
+            interval *= 2
+        while interval > 0.90:
+            interval /= 2
+        normalized.append(interval)
+    return max(40.0, min(220.0, 60 / median(normalized)))
+
+
+def _write_aligned_midi(
+    notes: list[_TimedNote],
+    pedals: list[_TimedPedal],
+    mapper,
+    tempo_bpm: float,
+    backend: str,
+) -> bytes:
+    midi = mido.MidiFile(type=1, ticks_per_beat=CANONICAL_DIVISIONS)
+    meta_track = mido.MidiTrack()
+    note_track = mido.MidiTrack()
+    midi.tracks.extend([meta_track, note_track])
+    meta_track.append(mido.MetaMessage("track_name", name="Tempo and meter", time=0))
+    meta_track.append(
+        mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(tempo_bpm), time=0)
+    )
+    meta_track.append(
+        mido.MetaMessage(
+            "time_signature",
+            numerator=4,
+            denominator=4,
+            clocks_per_click=24,
+            notated_32nd_notes_per_beat=8,
+            time=0,
+        )
+    )
+    note_track.append(
+        mido.MetaMessage("track_name", name=f"Piano transcription ({backend})", time=0)
+    )
+    note_track.append(mido.Message("program_change", program=0, channel=0, time=0))
+
+    events: list[tuple[int, int, mido.Message]] = []
+    for note in notes:
+        start_tick = max(0, round(mapper(note.start) * CANONICAL_DIVISIONS))
+        end_tick = max(start_tick + 15, round(mapper(note.end) * CANONICAL_DIVISIONS))
+        events.append(
+            (
+                start_tick,
+                2,
+                mido.Message(
+                    "note_on",
+                    note=note.pitch,
+                    velocity=max(1, min(127, note.velocity)),
+                    channel=0,
+                    time=0,
+                ),
+            )
+        )
+        events.append(
+            (
+                end_tick,
+                0,
+                mido.Message("note_off", note=note.pitch, velocity=0, channel=0, time=0),
+            )
+        )
+    previous_pedal: bool | None = None
+    for pedal in pedals:
+        if pedal.down == previous_pedal:
+            continue
+        events.append(
+            (
+                max(0, round(mapper(pedal.time) * CANONICAL_DIVISIONS)),
+                1,
+                mido.Message(
+                    "control_change",
+                    control=64,
+                    value=127 if pedal.down else 0,
+                    channel=0,
+                    time=0,
+                ),
+            )
+        )
+        previous_pedal = pedal.down
+
+    previous_tick = 0
+    for tick, _, message in sorted(events, key=lambda item: (item[0], item[1])):
+        message.time = tick - previous_tick
+        note_track.append(message)
+        previous_tick = tick
+    note_track.append(mido.MetaMessage("end_of_track", time=0))
+
+    output = BytesIO()
+    midi.save(file=output)
+    return output.getvalue()
