@@ -78,10 +78,19 @@ def compare_note_events(
     """Greedy onset/pitch matching, mir_eval style.
 
     A candidate note is a hit when an unmatched reference note with the same
-    pitch starts within ``onset_tolerance`` seconds.  Duration agreement is
-    reported separately for matched pairs so timing and release quality stay
-    visible as independent signals.
+    pitch starts within ``onset_tolerance``.  A constant timeline shift is
+    estimated and removed first: deliberate reframings (for example turning
+    the opening bar into a pickup) move every onset by the same amount, which
+    is a notation decision, not a fidelity loss.  Duration agreement is
+    reported separately for matched pairs.
     """
+
+    offset = _estimate_global_offset(reference, candidate, onset_tolerance)
+    if offset:
+        candidate = [
+            NoteEvent(note.pitch, note.onset + offset, note.offset + offset, note.velocity)
+            for note in candidate
+        ]
 
     remaining = sorted(reference, key=lambda event: (event.onset, event.pitch))
     hits = 0
@@ -143,7 +152,57 @@ def compare_note_events(
         ),
         "chroma_histogram_l1": round(chroma_l1, 4),
         "onset_tolerance": onset_tolerance,
+        "global_offset_removed": round(offset, 4),
     }
+
+
+def _estimate_global_offset(
+    reference: list[NoteEvent],
+    candidate: list[NoteEvent],
+    tolerance: float,
+    *,
+    max_offset: float = 4.0,
+    step: float = 0.02,
+) -> float:
+    """Constant shift (in the comparison unit) that best overlaps the onsets.
+
+    Periodic music aligns at many whole-beat shifts, so ties resolve to the
+    smallest absolute offset.  Pitch-blind matching is deliberate here: the
+    global rhythmic structure dominates, and the chosen shift is re-applied
+    before the strict pitch-constrained pass.
+    """
+
+    if not reference or not candidate:
+        return 0.0
+    reference_onsets = sorted(note.onset for note in reference)
+    candidate_onsets = sorted(note.onset for note in candidate)
+    span = max(reference_onsets[-1], candidate_onsets[-1])
+    limit = min(max_offset, span * 0.25)
+
+    def overlap(shift: float) -> int:
+        count = 0
+        index = 0
+        for onset in candidate_onsets:
+            moved = onset + shift
+            while index < len(reference_onsets) and reference_onsets[index] < moved - tolerance:
+                index += 1
+            probe = index
+            while probe < len(reference_onsets) and reference_onsets[probe] <= moved + tolerance:
+                probe += 1
+            if probe > index:
+                count += 1
+        return count
+
+    best_shift = 0.0
+    best_count = overlap(0.0)
+    steps = int(limit / step)
+    for k in range(1, steps + 1):
+        for shift in (k * step, -k * step):
+            count = overlap(shift)
+            if count > best_count:
+                best_count = count
+                best_shift = shift
+    return best_shift
 
 
 def musescore_convert(
@@ -235,12 +294,25 @@ def evaluate_roundtrip(
     in_beats: bool = True,
     audio_similarity_fn: Callable[[], dict[str, object]] | None = None,
 ) -> dict[str, object]:
+    reference = midi_note_events(source_midi, in_beats=in_beats)
+    candidate = midi_note_events(roundtrip_midi, in_beats=in_beats)
     report: dict[str, object] = {
         "note_level": compare_note_events(
-            midi_note_events(source_midi, in_beats=in_beats),
-            midi_note_events(roundtrip_midi, in_beats=in_beats),
+            reference,
+            candidate,
             onset_tolerance=onset_tolerance,
         ),
+        # A one-grid-cell displacement is a deliberate quantization decision,
+        # not a lost note; the ladder keeps both views visible.
+        "f1_ladder": {
+            str(tolerance): compare_note_events(
+                reference,
+                candidate,
+                onset_tolerance=tolerance,
+            )["onset_f1"]
+            for tolerance in (0.06, 0.12, 0.26)
+            if abs(tolerance - onset_tolerance) > 1e-9
+        },
         "comparison_units": "beats" if in_beats else "seconds",
     }
     if audio_similarity_fn is not None:

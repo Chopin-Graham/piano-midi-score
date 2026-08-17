@@ -148,6 +148,10 @@ async def convert_media(
         conversion_options = conversion_options.model_copy(
             update=conversion_updates
         )
+        if conversion_options.title is None:
+            conversion_options = conversion_options.model_copy(
+                update={"title": Path(filename).stem}
+            )
         transcription_options = TranscriptionOptions.model_validate(
             json.loads(transcription_options_json)
         )

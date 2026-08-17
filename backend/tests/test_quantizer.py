@@ -89,3 +89,57 @@ def test_clean_mode_keeps_deliberate_sixteenth_arpeggio_separate() -> None:
     )
 
     assert {note.onset for note in notes} == {0, 120, 240}
+
+
+def _audio_parsed(notes: list[RawNote]) -> ParsedMidi:
+    return ParsedMidi(
+        ticks_per_beat=480,
+        notes=notes,
+        tempos=[TempoEvent(0, 500_000)],
+        time_signatures=[TimeSignatureEvent(0, 4, 4)],
+    )
+
+
+def test_audio_auto_detects_genuine_triplet_measures() -> None:
+    notes: list[RawNote] = []
+    for measure in range(6):
+        base = measure * 1920
+        for beat in range(4):
+            for member in range(3):
+                onset = base + beat * 480 + member * 160
+                notes.append(
+                    RawNote(len(notes), 60 + member % 3, onset, onset + 140, 80, 0, 0)
+                )
+    options = ConversionOptions(
+        style="clean",
+        audio_transcription=True,
+        allow_triplets=False,
+    )
+
+    _, decisions, _, warnings = quantize_midi(
+        _audio_parsed(notes), Meter(4, 4), options
+    )
+
+    assert any(decision.triplet for decision in decisions)
+    assert any("三连音" in warning for warning in warnings)
+
+
+def test_audio_auto_keeps_binary_grid_for_noisy_binary_content() -> None:
+    notes: list[RawNote] = []
+    for measure in range(6):
+        base = measure * 1920
+        for step in range(16):
+            jitter = 12 if (measure + step) % 2 else -12
+            onset = base + step * 120 + jitter
+            notes.append(
+                RawNote(len(notes), 60 + step % 5, onset, onset + 100, 80, 0, 0)
+            )
+    options = ConversionOptions(
+        style="clean",
+        audio_transcription=True,
+        allow_triplets=False,
+    )
+
+    _, decisions, _, _ = quantize_midi(_audio_parsed(notes), Meter(4, 4), options)
+
+    assert all(not decision.triplet for decision in decisions)

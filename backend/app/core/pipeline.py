@@ -405,11 +405,15 @@ def _is_useful_track_title(name: str) -> bool:
         return False
     if re.fullmatch(r"(?:track|piano|instrument|staff)(?:\s+\d+)?", normalized):
         return False
+    if normalized.startswith("piano transcription"):
+        return False
     return normalized not in {
         "title",
         "untitled",
         "acoustic grand piano",
         "sequence name",
+        "tempo and meter",
+        "tempo map",
     }
 
 

@@ -312,7 +312,7 @@ export default function App() {
 
             <div className="toggle-list">
               <Toggle
-                label="识别三连音"
+                label={isMedia ? "强制三连音（默认自动识别）" : "识别三连音"}
                 checked={options.allow_triplets}
                 onChange={(allow_triplets) => setOptions({ ...options, allow_triplets })}
               />

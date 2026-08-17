@@ -84,11 +84,48 @@ def quantize_midi(
     for note in canonical:
         notes_by_measure[measure_index_at(measures, note.onset)].append(note)
 
+    # Audio transcriptions default to "triplets off", which crushes genuinely
+    # ternary passages onto a binary grid.  Treat that switch as "auto" in
+    # transcription mode: a piece earns triplet grids only when a solid share
+    # of measures fit a triplet grid far better than any binary one — random
+    # model timing noise cannot produce that margin because the finer binary
+    # grid fits noise at least as well.
+    candidate_options = options
+    if options.audio_transcription and not options.allow_triplets:
+        probe = options.model_copy(update={"allow_triplets": True})
+        votes = 0
+        total = 0
+        for measure_index, measure in enumerate(measures):
+            measure_notes = notes_by_measure.get(measure_index, [])
+            if len(measure_notes) < 3:
+                continue
+            probe_candidates = _grid_candidates(probe, measure.meter)
+            binary_error = min(
+                (_grid_timing_error(measure_notes, measure.start, grid.step)
+                 for grid in probe_candidates if not grid.triplet),
+                default=None,
+            )
+            triplet_error = min(
+                (_grid_timing_error(measure_notes, measure.start, grid.step)
+                 for grid in probe_candidates if grid.triplet),
+                default=None,
+            )
+            if binary_error is None or triplet_error is None:
+                continue
+            total += 1
+            if triplet_error < binary_error * 0.6:
+                votes += 1
+        if total >= 4 and votes / total >= 0.12:
+            candidate_options = probe
+            warnings.append(
+                f"有 {votes}/{total} 个小节在三连音网格上的拟合显著更优，已自动启用三连音识别"
+            )
+
     decisions: list[GridDecision] = []
     quantized: list[QuantizedNote] = []
 
     for measure_index, measure in enumerate(measures):
-        candidates = _grid_candidates(options, measure.meter)
+        candidates = _grid_candidates(candidate_options, measure.meter)
         measure_notes = notes_by_measure.get(measure_index, [])
         if not measure_notes:
             decisions.append(
@@ -197,6 +234,20 @@ def _grid_cost(
     tiny_factor = {"clean": 0.05, "balanced": 0.02, "faithful": 0.0}[style]
     tiny_penalty = tiny_values * tiny_factor / len(notes)
     return timing_error + grid.complexity + collapse_penalty + tiny_penalty
+
+
+def _grid_timing_error(
+    notes: list[QuantizedNote],
+    measure_start: int,
+    step: int,
+) -> float:
+    errors: list[float] = []
+    for note in notes:
+        snapped_onset = measure_start + _nearest_multiple(note.onset - measure_start, step)
+        snapped_end = measure_start + _nearest_multiple(note.end - measure_start, step)
+        errors.append(abs(snapped_onset - note.onset) / (CANONICAL_DIVISIONS / 4))
+        errors.append(abs(snapped_end - note.end) / (CANONICAL_DIVISIONS / 4))
+    return fmean(errors) if errors else 0.0
 
 
 def _nearest_multiple(value: int, step: int) -> int:

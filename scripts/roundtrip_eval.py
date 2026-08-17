@@ -49,6 +49,11 @@ def main() -> int:
         action="store_true",
         help="Treat input as an audio-transcription MIDI (release cleanup etc.)",
     )
+    parser.add_argument(
+        "--allow-triplets",
+        action="store_true",
+        help="Force triplet grids on (default for audio mode: auto-detect)",
+    )
     parser.add_argument("--audio", action="store_true", help="Add audio-level similarity")
     parser.add_argument("--pages", action="store_true", help="Render PDF pages to PNG")
     parser.add_argument("--dpi", type=int, default=150)
@@ -72,6 +77,7 @@ def main() -> int:
     options = ConversionOptions(
         style=args.style,
         audio_transcription=args.audio_transcription,
+        allow_triplets=args.allow_triplets or not args.audio_transcription,
     )
     musicxml, analysis, warnings, _score = convert_midi_with_score(
         source_bytes,
