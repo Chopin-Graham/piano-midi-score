@@ -431,8 +431,24 @@ def _postprocess_midi(
         aligned,
         source_tempo,
     )
+    meter_numerator, downbeat_phase = _estimate_meter_and_downbeat(aligned, mapper)
+    if downbeat_phase:
+        base_mapper = mapper
 
-    midi_bytes = _write_aligned_midi(aligned, pedals, mapper, tempo_bpm, backend)
+        def mapper(seconds: float) -> float:
+            # Shift barlines onto the detected downbeats; the extra measure
+            # keeps positions positive so pickup material lands in bar one and
+            # the notation pipeline can reframe it as an anacrusis.
+            return max(0.0, base_mapper(seconds) - downbeat_phase + meter_numerator)
+
+    midi_bytes = _write_aligned_midi(
+        aligned,
+        pedals,
+        mapper,
+        tempo_bpm,
+        backend,
+        meter_numerator=meter_numerator,
+    )
     duration = max(note.end for note in aligned)
     warnings: list[str] = []
     note_density = len(aligned) / max(duration, 1.0)
@@ -444,6 +460,14 @@ def _postprocess_midi(
         warnings.append(
             "The detected beat grid did not improve the transcription attack alignment; "
             f"used a stable {tempo_bpm:.1f} BPM timeline instead"
+        )
+    if meter_numerator != 4:
+        warnings.append(
+            f"Accent analysis suggests a {meter_numerator}/4 meter; barlines follow the detected downbeats"
+        )
+    elif downbeat_phase:
+        warnings.append(
+            "Barlines were shifted onto the detected downbeats; the opening bar becomes a pickup"
         )
     if cleaning["removed_short_notes"] > max(20, round(len(notes) * 0.08)):
         warnings.append(
@@ -458,6 +482,8 @@ def _postprocess_midi(
             "pitch_max": max(note.pitch for note in aligned),
             "tempo_bpm": round(tempo_bpm, 3),
             "alignment_method": alignment_method,
+            "detected_meter": f"{meter_numerator}/4",
+            "downbeat_phase_beats": downbeat_phase,
             **cleaning,
             **attack_analysis,
             **tempo_analysis,
@@ -881,6 +907,59 @@ def _beat_mapper(
     return mapper, 60 / period
 
 
+def _estimate_meter_and_downbeat(
+    notes: list[_TimedNote],
+    mapper: Callable[[float], float],
+) -> tuple[int, float]:
+    """Choose the measure length and downbeat phase from accent evidence.
+
+    Transcription MIDIs are written with a 4/4 signature by default, which
+    mis-bars waltzes and leaves pickup pieces starting mid-bar.  Score each
+    hypothesis by weighted attack mass on barlines, low-bass presence, and
+    long-note starts; 4/4 with zero phase is the incumbent and only loses to a
+    clearly better hypothesis.
+    """
+
+    columns: dict[float, list[_TimedNote]] = {}
+    for note in notes:
+        key = round(mapper(note.start) * 24) / 24
+        columns.setdefault(key, []).append(note)
+    if len(columns) < 8:
+        return 4, 0.0
+
+    total_weight = 0.0
+    scores: dict[tuple[int, int], float] = {}
+    hypotheses = [(4, phase) for phase in range(4)] + [(3, phase) for phase in range(3)]
+    for hypothesis in hypotheses:
+        scores[hypothesis] = 0.0
+    for onset, column in columns.items():
+        # One column, one vote: taking the loudest attack instead of summing
+        # the column keeps a dense off-beat chord from outvoting the bass.
+        weight = max(note.velocity for note in column) / 127
+        lowest = min(note.pitch for note in column)
+        longest = max(mapper(note.end) - mapper(note.start) for note in column)
+        total_weight += weight
+        is_bass = lowest <= 45
+        is_long = longest >= 1.5
+        for meter, phase in hypotheses:
+            position = (onset - phase) % meter
+            if min(position, meter - position) < 0.13:
+                scores[(meter, phase)] += weight
+                if is_bass:
+                    scores[(meter, phase)] += 0.5 * weight
+                if is_long:
+                    scores[(meter, phase)] += 0.5 * weight
+
+    incumbent = scores[(4, 0)]
+    best, best_score = max(scores.items(), key=lambda item: item[1])
+    reference = max(total_weight, 1.0)
+    if best == (4, 0):
+        return 4, 0.0
+    if best_score > incumbent + 0.06 * reference and best_score > 0.34 * reference:
+        return best
+    return 4, 0.0
+
+
 def _estimate_note_tempo(notes: list[_TimedNote], source_tempo: float) -> float:
     onsets = sorted({round(note.start, 4) for note in notes})
     intervals = [
@@ -906,6 +985,8 @@ def _write_aligned_midi(
     mapper,
     tempo_bpm: float,
     backend: str,
+    *,
+    meter_numerator: int = 4,
 ) -> bytes:
     midi = mido.MidiFile(type=1, ticks_per_beat=CANONICAL_DIVISIONS)
     meta_track = mido.MidiTrack()
@@ -918,7 +999,7 @@ def _write_aligned_midi(
     meta_track.append(
         mido.MetaMessage(
             "time_signature",
-            numerator=4,
+            numerator=meter_numerator,
             denominator=4,
             clocks_per_click=24,
             notated_32nd_notes_per_beat=8,

@@ -8,6 +8,7 @@ from app.core.media_transcription import (
     _align_attack_columns,
     _beat_mapper,
     _clean_notes,
+    _estimate_meter_and_downbeat,
     _postprocess_midi,
     _select_timeline_mapper,
     _TimedNote,
@@ -164,3 +165,46 @@ def test_postprocess_outputs_aligned_piano_midi() -> None:
     )
     assert len(warnings) == 1
     assert f"stable {analysis['tempo_bpm']:.1f} BPM timeline" in warnings[0]
+
+
+def _accented_pattern(
+    measures: int,
+    beats_per_measure: int,
+    *,
+    phase_beats: float = 0.0,
+) -> list[_TimedNote]:
+    seconds_per_beat = 0.5  # 120 BPM
+    notes: list[_TimedNote] = []
+    for measure in range(measures):
+        base = (measure * beats_per_measure + phase_beats) * seconds_per_beat
+        notes.append(_TimedNote(36, base, base + 1.8 * seconds_per_beat, 96))
+        for beat in range(1, beats_per_measure):
+            onset = base + beat * seconds_per_beat
+            for pitch in (60, 64, 67):
+                notes.append(_TimedNote(pitch, onset, onset + 0.4 * seconds_per_beat, 68))
+    return notes
+
+
+def test_estimate_meter_detects_three_four() -> None:
+    notes = _accented_pattern(12, 3)
+
+    meter, phase = _estimate_meter_and_downbeat(notes, lambda seconds: seconds * 2.0)
+
+    assert meter == 3
+
+
+def test_estimate_meter_keeps_four_four_for_common_time() -> None:
+    notes = _accented_pattern(12, 4)
+
+    meter, phase = _estimate_meter_and_downbeat(notes, lambda seconds: seconds * 2.0)
+
+    assert (meter, phase) == (4, 0.0)
+
+
+def test_estimate_meter_shifts_barlines_onto_downbeats() -> None:
+    notes = _accented_pattern(12, 4, phase_beats=1.0)
+
+    meter, phase = _estimate_meter_and_downbeat(notes, lambda seconds: seconds * 2.0)
+
+    assert meter == 4
+    assert phase == 1.0
