@@ -82,6 +82,12 @@ export interface ConversionResponse {
       processing_ms?: number;
     };
     quantization_grids: Record<string, number>;
+    key_signatures?: Array<{ measure: number; fifths: number }>;
+    ornaments?: {
+      trills: number;
+      grace_notes: number;
+      trill_absorbed_attacks?: number;
+    };
     complexity_score: number;
     processing_ms: number;
     source: Record<string, unknown>;

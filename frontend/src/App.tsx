@@ -408,6 +408,23 @@ export default function App() {
               <Metric label="质量" value={qualityLabel} />
               <Metric label="版面" value={result.analysis.engraving?.page_size ?? "MusicXML"} />
               <Metric label="页数" value={result.analysis.engraving?.page_count ?? "—"} />
+              {result.analysis.key_signatures && result.analysis.key_signatures.length > 1 && (
+                <Metric label="转调" value={`${result.analysis.key_signatures.length - 1} 处`} />
+              )}
+              {result.analysis.transcription?.detected_meter ? (
+                <Metric
+                  label="检测拍号"
+                  value={String(result.analysis.transcription.detected_meter)}
+                />
+              ) : null}
+              {result.analysis.ornaments &&
+              (result.analysis.ornaments.trills > 0 ||
+                result.analysis.ornaments.grace_notes > 0) ? (
+                <Metric
+                  label="装饰音"
+                  value={`颤音 ${result.analysis.ornaments.trills} / 倚音 ${result.analysis.ornaments.grace_notes}`}
+                />
+              ) : null}
               {result.analysis.transcription && (
                 <Metric
                   label="转录"
