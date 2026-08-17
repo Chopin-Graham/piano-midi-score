@@ -193,10 +193,46 @@ def _write_similarity(reference_path: Path, candidate_path: Path, output_path: P
         else 0.0
     )
 
+    # Linear time-warp: a rubato performance notated at one constant tempo
+    # drifts linearly against the recording.  Resampling the candidate chroma
+    # onto the reference frame count isolates pitch-content differences from
+    # that intentional tempo normalization.
+    warped_cosine = None
+    reference_full = librosa.feature.chroma_cens(y=reference, sr=sample_rate)
+    candidate_full = librosa.feature.chroma_cens(y=candidate, sr=sample_rate)
+    if reference_full.shape[1] > 1 and candidate_full.shape[1] > 1:
+        warp_grid = np.linspace(
+            0, candidate_full.shape[1] - 1, reference_full.shape[1]
+        )
+        warped = np.stack(
+            [
+                np.interp(
+                    warp_grid,
+                    np.arange(candidate_full.shape[1]),
+                    candidate_full[row],
+                )
+                for row in range(candidate_full.shape[0])
+            ]
+        )
+        warp_norms = np.linalg.norm(reference_full, axis=0) * np.linalg.norm(
+            warped, axis=0
+        )
+        warp_valid = warp_norms > 1e-6
+        if np.any(warp_valid):
+            warped_cosine = float(
+                np.mean(
+                    np.sum(reference_full[:, warp_valid] * warped[:, warp_valid], axis=0)
+                    / warp_norms[warp_valid]
+                )
+            )
+
     output_path.write_text(
         json.dumps(
             {
                 "chroma_cosine": round(chroma_cosine, 4),
+                "chroma_cosine_timewarped": (
+                    round(warped_cosine, 4) if warped_cosine is not None else None
+                ),
                 "onset_correlation": round(onset_correlation, 4),
                 "alignment_lag_frames": lag,
                 "reference_duration_s": round(len(reference) / sample_rate, 3),
