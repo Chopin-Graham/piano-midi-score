@@ -50,6 +50,15 @@ def main() -> None:
         default="classic",
     )
     parser.add_argument("--title")
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help=(
+            "Close the loop: convert the engraved MusicXML back to MIDI, compare "
+            "it with the aligned transcription at note level, and compare "
+            "synthesized score audio with the original audio (chroma/onset)"
+        ),
+    )
     args = parser.parse_args()
 
     input_path = args.input.resolve()
@@ -126,10 +135,26 @@ def main() -> None:
         ),
     }
     report_path = output / f"{stem}-report.json"
+    if args.evaluate:
+        report["roundtrip_evaluation"] = _evaluate_roundtrip(
+            input_path,
+            transcription.midi_bytes,
+            musicxml,
+            output,
+        )
     report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    if args.evaluate:
+        evaluation = report["roundtrip_evaluation"]
+        print(f"Round-trip note F1: {evaluation['note_level']['onset_f1']}", flush=True)
+        audio_level = evaluation.get("audio_level") or {}
+        if "chroma_cosine" in audio_level:
+            print(
+                f"Score-vs-original audio chroma: {audio_level['chroma_cosine']}",
+                flush=True,
+            )
     print(f"MIDI: {midi_path}", flush=True)
     print(f"MusicXML: {musicxml_path}", flush=True)
     print(f"PDF: {pdf_path if engraving.pdf_bytes else 'unavailable'}", flush=True)
@@ -139,6 +164,53 @@ def main() -> None:
 def _safe_stem(value: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-._")
     return (normalized or "transcription")[:80]
+
+
+def _evaluate_roundtrip(
+    input_path: Path,
+    aligned_midi: bytes,
+    musicxml: str,
+    output: Path,
+) -> dict[str, object]:
+    """Measure how much music survives the full transcription+engraving loop."""
+
+    import tempfile
+
+    from app.core.engraver import find_musescore
+    from app.core.media_transcription import (
+        _prepare_audio,
+        find_audio_python,
+        find_ffmpeg,
+    )
+    from app.core.roundtrip import (
+        audio_similarity,
+        evaluate_roundtrip,
+        musicxml_to_midi_bytes,
+    )
+
+    musescore = find_musescore()
+    ffmpeg = find_ffmpeg()
+    if musescore is None or ffmpeg is None:
+        return {"error": "MuseScore and FFmpeg are both required for evaluation"}
+
+    with tempfile.TemporaryDirectory(prefix="piano-transcription-eval-") as temporary:
+        workdir = Path(temporary)
+        roundtrip_bytes = musicxml_to_midi_bytes(musicxml, musescore)
+        result = evaluate_roundtrip(aligned_midi, roundtrip_bytes)
+
+        source_wav = workdir / "original.wav"
+        _prepare_audio(ffmpeg, input_path, source_wav)
+        roundtrip_midi_path = workdir / "roundtrip.mid"
+        roundtrip_midi_path.write_bytes(roundtrip_bytes)
+        result["audio_level"] = audio_similarity(
+            find_audio_python(),
+            PROJECT_ROOT / "backend" / "app" / "audio_worker.py",
+            source_wav,
+            roundtrip_midi_path,
+            workdir,
+        )
+    result["artifacts"] = {"evaluation_dir": str(output)}
+    return result
 
 
 if __name__ == "__main__":

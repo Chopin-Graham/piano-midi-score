@@ -25,8 +25,10 @@
 - MuseScore Studio 4 负责最终的 A4 间距、碰撞规避、分页与 PDF 导出。
 - MuseScore 不可用时仍返回 MusicXML，并由 OpenSheetMusicDisplay 提供网页回退预览。
 - 音频/视频通过 FFmpeg 抽取 44.1 kHz 单声道 PCM；默认用 Transkun 钢琴专用模型，Basic Pitch 作为 Windows 兼容降级路径。
-- Librosa 节拍跟踪把模型的秒级起止时间动态映射到拍点；随后只删除亚帧或极弱短伪音，保留快速强起音并规范其释放，再清理重复音和同音重叠。
-- 网页支持 `.wav/.flac/.mp3/.m4a/.ogg/.opus/.aac` 与 `.mp4/.mov/.mkv/.webm`，并可下载转录后的 MIDI。
+- Librosa 节拍跟踪把模型的秒级起止时间动态映射到拍点；重音列分析再决定 3/4 与 4/4 拍号和强拍相位，弱起进入会在制谱层重组为不完全小节；随后只删除亚帧或极弱短伪音，保留快速强起音并规范其释放，再清理重复音和同音重叠。
+- 无调号事件时按滑动窗口做 Krumhansl 调性估计，并用 Viterbi 平滑与短段坍缩只在持续转调处改变调号，避免主属反复造成的调号抖动。
+- 音频模式默认按证据自动启用三连音网格；连续快速二度交替识别为颤音记号；含休止符的三连音组保证括号完整，MuseScore 可直接载入。
+- 网页支持 `.wav/.flac/.mp3/.m4a/.ogg/.opus/.aac` 与 `.mp4/.mov/.mkv/.webm`，并可下载转录后的 MIDI；也可直接上传 `.musicxml/.xml/.mxl` 乐谱文件，导出 A4 PDF 与 MIDI。
 
 ## 环境要求
 

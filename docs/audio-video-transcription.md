@@ -8,8 +8,9 @@
   -> Transkun 钢琴转录（Basic Pitch 降级）
   -> 音域、极短音、重复音、同音重叠清理
   -> Librosa 节拍跟踪与分段线性拍点映射
+  -> 重音列分析：3/4 与 4/4 拍号、强拍相位
   -> 可下载的标准 MIDI
-  -> MIDI 制谱语义流水线
+  -> MIDI 制谱语义流水线（弱起重组、分段调性、三连音自动识别、颤音记号）
   -> MusicXML 4.0
   -> MuseScore Studio A4 PDF
 ```
