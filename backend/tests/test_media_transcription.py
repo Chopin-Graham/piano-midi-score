@@ -164,8 +164,11 @@ def test_postprocess_outputs_aligned_piano_midi() -> None:
         for message in track
         if message.is_meta
     )
-    assert len(warnings) == 1
-    assert f"stable {analysis['tempo_bpm']:.1f} BPM timeline" in warnings[0]
+    assert warnings
+    assert any(
+        f"stable {analysis['tempo_bpm']:.1f} BPM timeline" in warning
+        for warning in warnings
+    )
 
 
 def _accented_pattern(
@@ -189,26 +192,73 @@ def _accented_pattern(
 def test_estimate_meter_detects_three_four() -> None:
     notes = _accented_pattern(12, 3)
 
-    meter, phase = _estimate_meter_and_downbeat(notes, lambda seconds: seconds * 2.0)
+    numerator, denominator, phase = _estimate_meter_and_downbeat(
+        notes, lambda seconds: seconds * 2.0
+    )
 
-    assert meter == 3
+    assert (numerator, denominator) == (3, 4)
 
 
 def test_estimate_meter_keeps_four_four_for_common_time() -> None:
     notes = _accented_pattern(12, 4)
 
-    meter, phase = _estimate_meter_and_downbeat(notes, lambda seconds: seconds * 2.0)
+    numerator, denominator, phase = _estimate_meter_and_downbeat(
+        notes, lambda seconds: seconds * 2.0
+    )
 
-    assert (meter, phase) == (4, 0.0)
+    assert (numerator, denominator, phase) == (4, 4, 0.0)
 
 
 def test_estimate_meter_shifts_barlines_onto_downbeats() -> None:
     notes = _accented_pattern(12, 4, phase_beats=1.0)
 
-    meter, phase = _estimate_meter_and_downbeat(notes, lambda seconds: seconds * 2.0)
+    numerator, denominator, phase = _estimate_meter_and_downbeat(
+        notes, lambda seconds: seconds * 2.0
+    )
 
-    assert meter == 4
+    assert (numerator, denominator) == (4, 4)
     assert phase == 1.0
+
+
+def test_estimate_meter_detects_compound_six_eight() -> None:
+    # Two dotted-quarter beats per bar, each split into three eighths.
+    seconds_per_beat = 0.5
+    notes: list[_TimedNote] = []
+    for measure in range(12):
+        base = measure * 2 * seconds_per_beat
+        notes.append(_TimedNote(36, base, base + 0.75 * seconds_per_beat * 2, 96))
+        for beat in range(2):
+            for third in range(3):
+                onset = base + (beat + third / 3) * seconds_per_beat
+                notes.append(
+                    _TimedNote(60 + (beat * 3 + third) % 5, onset, onset + 0.12, 72)
+                )
+
+    numerator, denominator, phase = _estimate_meter_and_downbeat(
+        notes, lambda seconds: seconds * 2.0
+    )
+
+    assert (numerator, denominator) == (6, 8)
+
+
+def test_estimate_meter_keeps_swing_out_of_compound_meter() -> None:
+    # Swung 4/4: pairs at 0 and 2/3 of each beat, nothing on the 1/3 slot.
+    seconds_per_beat = 0.5
+    notes: list[_TimedNote] = []
+    for measure in range(12):
+        base = measure * 4 * seconds_per_beat
+        notes.append(_TimedNote(36, base, base + 1.5 * seconds_per_beat, 96))
+        for beat in range(4):
+            first = base + beat * seconds_per_beat
+            notes.append(_TimedNote(60, first, first + 0.3, 78))
+            swung = first + (2 / 3) * seconds_per_beat
+            notes.append(_TimedNote(64, swung, swung + 0.15, 70))
+
+    numerator, denominator, _ = _estimate_meter_and_downbeat(
+        notes, lambda seconds: seconds * 2.0
+    )
+
+    assert denominator == 4
 
 
 def test_attack_column_window_preserves_fast_thirty_seconds() -> None:

@@ -434,15 +434,32 @@ def _postprocess_midi(
         aligned,
         source_tempo,
     )
-    meter_numerator, downbeat_phase = _estimate_meter_and_downbeat(aligned, mapper)
-    if downbeat_phase:
+    meter_numerator, meter_denominator, downbeat_phase = _estimate_meter_and_downbeat(
+        aligned, mapper
+    )
+    if meter_denominator == 8:
+        # The tracker locked to the dotted-quarter beat: rescale into
+        # quarter-note units (one tracked beat = 1.5 quarters) and express the
+        # tempo per quarter so real-time seconds survive the rewrite.
         base_mapper = mapper
+
+        def mapper(seconds: float) -> float:
+            return base_mapper(seconds) * 1.5
+
+        tempo_bpm *= 1.5
+        downbeat_phase *= 1.5
+    measure_quarters = meter_numerator * 4.0 / meter_denominator
+    if downbeat_phase:
+        phase_mapper = mapper
 
         def mapper(seconds: float) -> float:
             # Shift barlines onto the detected downbeats; the extra measure
             # keeps positions positive so pickup material lands in bar one and
             # the notation pipeline can reframe it as an anacrusis.
-            return max(0.0, base_mapper(seconds) - downbeat_phase + meter_numerator)
+            return max(
+                0.0,
+                phase_mapper(seconds) - downbeat_phase + measure_quarters,
+            )
 
     midi_bytes = _write_aligned_midi(
         aligned,
@@ -451,6 +468,7 @@ def _postprocess_midi(
         tempo_bpm,
         backend,
         meter_numerator=meter_numerator,
+        meter_denominator=meter_denominator,
     )
     duration = max(note.end for note in aligned)
     warnings: list[str] = []
@@ -464,9 +482,10 @@ def _postprocess_midi(
             "The detected beat grid did not improve the transcription attack alignment; "
             f"used a stable {tempo_bpm:.1f} BPM timeline instead"
         )
-    if meter_numerator != 4:
+    if (meter_numerator, meter_denominator) != (4, 4):
         warnings.append(
-            f"Accent analysis suggests a {meter_numerator}/4 meter; barlines follow the detected downbeats"
+            f"Accent analysis suggests a {meter_numerator}/{meter_denominator} meter; "
+            "barlines follow the detected downbeats"
         )
     elif downbeat_phase:
         warnings.append(
@@ -485,7 +504,7 @@ def _postprocess_midi(
             "pitch_max": max(note.pitch for note in aligned),
             "tempo_bpm": round(tempo_bpm, 3),
             "alignment_method": alignment_method,
-            "detected_meter": f"{meter_numerator}/4",
+            "detected_meter": f"{meter_numerator}/{meter_denominator}",
             "downbeat_phase_beats": downbeat_phase,
             **cleaning,
             **attack_analysis,
@@ -926,14 +945,16 @@ def _beat_mapper(
 def _estimate_meter_and_downbeat(
     notes: list[_TimedNote],
     mapper: Callable[[float], float],
-) -> tuple[int, float]:
-    """Choose the measure length and downbeat phase from accent evidence.
+) -> tuple[int, int, float]:
+    """Choose the measure length, subdivision family, and downbeat phase.
 
-    Transcription MIDIs are written with a 4/4 signature by default, which
-    mis-bars waltzes and leaves pickup pieces starting mid-bar.  Score each
-    hypothesis by weighted attack mass on barlines, low-bass presence, and
-    long-note starts; 4/4 with zero phase is the incumbent and only loses to a
-    clearly better hypothesis.
+    Transcription MIDIs would otherwise always be written 4/4, which mis-bars
+    waltzes and compound-meter pieces.  Accent evidence (weighted attack mass
+    on barlines, low-bass presence, long-note starts) scores 2/3/4-beat
+    hypotheses at every phase; 4/4 with zero phase is the incumbent and only
+    loses by a clear margin.  A ternary-subdivision test then distinguishes
+    compound meters (6/8, 9/8, 12/8) from simple ones — swing feels occupy
+    only the 2/3 position and therefore stay binary.
     """
 
     columns: dict[float, list[_TimedNote]] = {}
@@ -941,11 +962,15 @@ def _estimate_meter_and_downbeat(
         key = round(mapper(note.start) * 24) / 24
         columns.setdefault(key, []).append(note)
     if len(columns) < 8:
-        return 4, 0.0
+        return 4, 4, 0.0
 
     total_weight = 0.0
     scores: dict[tuple[int, int], float] = {}
-    hypotheses = [(4, phase) for phase in range(4)] + [(3, phase) for phase in range(3)]
+    hypotheses = (
+        [(4, phase) for phase in range(4)]
+        + [(3, phase) for phase in range(3)]
+        + [(2, phase) for phase in range(2)]
+    )
     for hypothesis in hypotheses:
         scores[hypothesis] = 0.0
     for onset, column in columns.items():
@@ -966,14 +991,75 @@ def _estimate_meter_and_downbeat(
                 if is_long:
                     scores[(meter, phase)] += 0.5 * weight
 
-    incumbent = scores[(4, 0)]
-    best, best_score = max(scores.items(), key=lambda item: item[1])
     reference = max(total_weight, 1.0)
-    if best == (4, 0):
-        return 4, 0.0
-    if best_score > incumbent + 0.06 * reference and best_score > 0.34 * reference:
-        return best
-    return 4, 0.0
+    margin = 0.06 * reference
+
+    def family_winner(meter: int) -> tuple[int, int]:
+        return max(
+            ((meter, phase) for phase in range(meter)),
+            key=lambda hypothesis: scores[hypothesis],
+        )
+
+    best4 = family_winner(4)
+    best3 = family_winner(3)
+    best2 = family_winner(2)
+
+    if (
+        scores[best3] > scores[best4] + margin
+        and scores[best3] > scores[best2] + margin
+    ):
+        numerator, phase = 3, best3[1]
+    elif (
+        scores[best2] > scores[best4] + margin
+        and _ternary_subdivision_dominant(notes, mapper, best2[1])
+    ):
+        return 6, 8, float(best2[1])
+    elif scores[best4] > scores[(4, 0)] + margin:
+        numerator, phase = 4, best4[1]
+    else:
+        numerator, phase = 4, 0
+
+    if _ternary_subdivision_dominant(notes, mapper, float(phase)):
+        return numerator * 3, 8, float(phase)
+    return numerator, 4, float(phase)
+
+
+def _ternary_subdivision_dominant(
+    notes: list[_TimedNote],
+    mapper: Callable[[float], float],
+    phase: float,
+) -> bool:
+    """Whether sub-beat onsets live on the ternary grid (both third slots).
+
+    Swing pairs occupy only the 2/3 slot, so requiring evidence on both third
+    positions keeps swung simple meter from being rebranded as compound.
+    """
+
+    third_hits = 0
+    first_slot = 0
+    binary_hits = 0
+    for note in notes:
+        fraction = (mapper(note.start) - phase) % 1.0
+        if fraction < 0.06 or fraction > 0.94:
+            continue
+        third_distance = min(abs(fraction - 1 / 3), abs(fraction - 2 / 3))
+        binary_distance = min(
+            abs(fraction - 0.25), abs(fraction - 0.5), abs(fraction - 0.75)
+        )
+        if third_distance <= 0.06 and third_distance < binary_distance:
+            third_hits += 1
+            if abs(fraction - 1 / 3) < abs(fraction - 2 / 3):
+                first_slot += 1
+        elif binary_distance <= 0.06:
+            binary_hits += 1
+    total = third_hits + binary_hits
+    if total < 6:
+        return False
+    return (
+        third_hits / total >= 0.6
+        and first_slot >= 2
+        and third_hits - first_slot >= 2
+    )
 
 
 def _estimate_note_tempo(notes: list[_TimedNote], source_tempo: float) -> float:
@@ -1003,6 +1089,7 @@ def _write_aligned_midi(
     backend: str,
     *,
     meter_numerator: int = 4,
+    meter_denominator: int = 4,
 ) -> bytes:
     midi = mido.MidiFile(type=1, ticks_per_beat=CANONICAL_DIVISIONS)
     meta_track = mido.MidiTrack()
@@ -1016,8 +1103,8 @@ def _write_aligned_midi(
         mido.MetaMessage(
             "time_signature",
             numerator=meter_numerator,
-            denominator=4,
-            clocks_per_click=24,
+            denominator=meter_denominator,
+            clocks_per_click=24 if meter_denominator == 4 else 36,
             notated_32nd_notes_per_beat=8,
             time=0,
         )
