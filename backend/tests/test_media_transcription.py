@@ -116,6 +116,33 @@ def test_tempo_selector_rejects_a_misleading_fast_beat_layer() -> None:
     )
 
 
+def test_tempo_selector_accepts_a_confident_dynamic_beat_grid() -> None:
+    beat_times = [0.0, 0.42, 0.87, 1.27, 1.75, 2.16, 2.62, 3.03]
+    notes = []
+    for index, start in enumerate(beat_times[:-1]):
+        midpoint = (start + beat_times[index + 1]) / 2
+        notes.extend(
+            [
+                _TimedNote(48 + index % 4, start, start + 0.16, 76),
+                _TimedNote(64 + index % 5, midpoint, midpoint + 0.15, 82),
+            ]
+        )
+
+    mapper, tempo, method, analysis = _select_timeline_mapper(
+        beat_times,
+        notes,
+        source_tempo=120,
+    )
+
+    assert method == "librosa_dynamic_beat_warp"
+    assert tempo > 130
+    assert abs(mapper(beat_times[4]) - 4.0) < 1e-9
+    selected = next(
+        candidate for candidate in analysis["tempo_candidates"] if candidate["selected"]
+    )
+    assert selected["grid_hit_rate"] > 0.9
+
+
 def test_postprocess_outputs_aligned_piano_midi() -> None:
     midi_bytes, analysis, warnings = _postprocess_midi(
         piano_midi_bytes(two_tracks=True, jitter=0, measures=2),

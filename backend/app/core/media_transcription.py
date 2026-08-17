@@ -739,7 +739,10 @@ def _select_timeline_mapper(
             density_penalty += (columns_per_quarter - 4.5) * 0.02
         elif columns_per_quarter < 0.65:
             density_penalty += (0.65 - columns_per_quarter) * 0.02
-        source_prior = abs(log2(tempo / source_tempo)) * 0.04
+        # Transcription backends commonly write an arbitrary 120 BPM tempo into
+        # their output MIDI.  It is useful as a weak tie-breaker, but must not
+        # overrule a clearly better audio-derived beat grid.
+        source_prior = abs(log2(tempo / source_tempo)) * 0.006
         dynamic_penalty = 0.003 if dynamic else 0.0
         total_score = rhythm_score + density_penalty + source_prior + dynamic_penalty
         selected_mappers[method] = mapper
@@ -760,16 +763,11 @@ def _select_timeline_mapper(
     source_candidate = next(
         item for item in scored if item["method"] == "constant_tempo_source"
     )
-    # Prefer a stable source timeline when another hypothesis is only a
-    # statistical tie. This is especially important for Transkun's dense
-    # accompaniment output, where interval histograms often overestimate BPM.
-    if (
-        float(source_candidate["grid_error"]) <= 0.065
-        and float(source_candidate["grid_hit_rate"]) >= 0.40
-    ):
-        best = source_candidate
-        selection_reason = "source_grid_already_readable"
-    elif float(source_candidate["score"]) <= float(best["score"]) + 0.003:
+    # Retain the source only for a genuine statistical tie.  Earlier versions
+    # treated any merely readable 120 BPM source grid as authoritative; for the
+    # Avid video this compressed roughly 810 written quarter notes to 653 and
+    # made every notated duration too short.
+    if float(source_candidate["score"]) <= float(best["score"]) + 0.003:
         best = source_candidate
         selection_reason = "source_statistical_tie"
     else:

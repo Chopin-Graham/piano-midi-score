@@ -78,18 +78,21 @@ def convert_midi_with_score(
     warnings.extend(quantizer_warnings)
     quantized_note_count = len(notes)
     scale = CANONICAL_DIVISIONS / parsed.ticks_per_beat
-    pedals = []
-    if options.include_pedal:
-        pedals = [
-            PedalEvent(round(event.tick * scale) - shift, event.channel, event.down)
-            for event in parsed.pedals
-            if round(event.tick * scale) - shift >= 0
-        ]
+    # Pedal is musical timing evidence even when the user chooses not to print
+    # pedal lines. Keep it available for hand continuity, written-release
+    # inference, and playability analysis; only suppress it in the exported
+    # score model.
+    analysis_pedals = [
+        PedalEvent(round(event.tick * scale) - shift, event.channel, event.down)
+        for event in parsed.pedals
+        if round(event.tick * scale) - shift >= 0
+    ]
+    engraved_pedals = analysis_pedals if options.include_pedal else []
     notes, hand_analysis, hand_warnings = assign_hands(
         notes,
         options,
         parsed.track_names,
-        pedals,
+        analysis_pedals,
     )
     warnings.extend(hand_warnings)
     notes, inferred_arpeggiated_chords = (
@@ -143,7 +146,7 @@ def convert_midi_with_score(
         notes,
         max_voices=options.max_voices_per_staff,
         style=options.style,
-        pedals=pedals,
+        pedals=analysis_pedals,
         measures=measures,
         transcription_mode=options.audio_transcription,
     )
@@ -178,7 +181,7 @@ def convert_midi_with_score(
         notes,
         expected_note_count=quantized_note_count,
         tempo_bpm=parsed.tempos[0].bpm,
-        pedals=pedals,
+        pedals=analysis_pedals,
         playability_notes=physical_notes,
         clef_changes=clef_changes,
         measures=measures,
@@ -200,7 +203,7 @@ def convert_midi_with_score(
         meter=meter,
         key=key,
         tempo_bpm=tempo_bpm,
-        pedals=pedals,
+        pedals=engraved_pedals,
         grid_decisions=grid_decisions,
         measure_count=measure_count,
         engraving_style=options.engraving_style,

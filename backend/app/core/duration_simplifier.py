@@ -41,6 +41,7 @@ def simplify_polyphonic_durations(
                 "pedal_extended_note_count": 0,
                 "legato_extended_note_count": 0,
                 "transcription_release_extended_note_count": 0,
+                "transcription_release_normalized_note_count": 0,
                 "method": "disabled",
             },
             [],
@@ -52,11 +53,15 @@ def simplify_polyphonic_durations(
         measures or [],
     )
     transcription_extended = 0
+    transcription_normalized = 0
     if transcription_mode:
-        notes, transcription_extended = _extend_transcription_release_gaps(
-            notes,
-            measures or [],
-            style,
+        notes, transcription_extended, transcription_normalized = (
+            _extend_transcription_release_gaps(
+                notes,
+                measures or [],
+                style,
+                pedals or [],
+            )
         )
     shortened = 0
     result: list[QuantizedNote] = []
@@ -141,7 +146,13 @@ def simplify_polyphonic_durations(
         warnings.append(
             f"为消除演奏型重叠并保持最多 {max_voices} 层清晰声部，已规范化 {shortened} 个音符时值（音头全部保留）"
         )
-    adjusted = pedal_extended + legato_extended + transcription_extended + shortened
+    adjusted = (
+        pedal_extended
+        + legato_extended
+        + transcription_extended
+        + transcription_normalized
+        + shortened
+    )
     return (
         sorted(result, key=lambda note: (note.onset, note.pitch, note.source_id)),
         {
@@ -150,6 +161,7 @@ def simplify_polyphonic_durations(
             "pedal_extended_note_count": pedal_extended,
             "legato_extended_note_count": legato_extended,
             "transcription_release_extended_note_count": transcription_extended,
+            "transcription_release_normalized_note_count": transcription_normalized,
             "method": "transcription_aware_shared_onset_duration_reduction",
         },
         warnings,
@@ -160,7 +172,8 @@ def _extend_transcription_release_gaps(
     notes: list[QuantizedNote],
     measures: list[MeasureSpan],
     style: str,
-) -> tuple[list[QuantizedNote], int]:
+    pedals: list[PedalEvent],
+) -> tuple[list[QuantizedNote], int, int]:
     """Infer conventional written releases from noisy audio offsets.
 
     Audio models estimate attacks much more reliably than key releases. In
@@ -172,17 +185,42 @@ def _extend_transcription_release_gaps(
     """
 
     if not notes:
-        return notes, 0
+        return notes, 0, 0
 
-    maximum_gap = CANONICAL_DIVISIONS // (4 if style == "clean" else 8)
+    # The legacy MIDIRearrange utility in the user's earlier workflow correctly
+    # treated attacks as the reliable part of an audio transcription, but its
+    # global "release at the next attack" rule truncated melody.  Audio models
+    # also commonly release an eighth-note accompaniment after a sixteenth, so
+    # extending every such note to the next detected attack can create hundreds
+    # of false dotted eighths whenever an intervening attack was missed.
+    #
+    # Use a written attack cell instead: clean output infers ordinary releases
+    # no farther than an eighth note, while balanced output stays at a
+    # sixteenth.  Longer values require stronger evidence from the original
+    # release, a melodic/bass edge, or continuous pedal under a low bass note.
+    attack_cell = CANONICAL_DIVISIONS // (2 if style == "clean" else 4)
+    maximum_gap = attack_cell
+    coverage = PedalCoverage(pedals)
     onsets_by_staff: dict[Staff, list[int]] = defaultdict(list)
+    notes_by_attack: dict[tuple[Staff, int], list[QuantizedNote]] = defaultdict(list)
+    next_same_pitch: dict[int, int | None] = {}
+    notes_by_pitch: dict[tuple[int, int], list[QuantizedNote]] = defaultdict(list)
     for note in notes:
         if note.staff is not None:
             onsets_by_staff[note.staff].append(note.onset)
+            notes_by_attack[(note.staff, note.onset)].append(note)
+        notes_by_pitch[(note.channel, note.pitch)].append(note)
     for staff in onsets_by_staff:
         onsets_by_staff[staff] = sorted(set(onsets_by_staff[staff]))
+    for pitch_notes in notes_by_pitch.values():
+        ordered = sorted(pitch_notes, key=lambda note: (note.onset, note.end, note.source_id))
+        for index, note in enumerate(ordered):
+            next_same_pitch[note.source_id] = (
+                ordered[index + 1].onset if index + 1 < len(ordered) else None
+            )
 
     extended = 0
+    normalized = 0
     result: list[QuantizedNote] = []
     for note in notes:
         if note.staff is None:
@@ -193,23 +231,222 @@ def _extend_transcription_release_gaps(
         next_onset = (
             later_onsets[next_index] if next_index < len(later_onsets) else None
         )
+        attack_notes = notes_by_attack[(note.staff, note.onset)]
+        next_attack_notes = (
+            notes_by_attack[(note.staff, next_onset)]
+            if next_onset is not None
+            else []
+        )
+        column_edge = _is_staff_edge(note, attack_notes)
+        held_edge = _is_held_melodic_edge(note, attack_notes, next_attack_notes)
+        same_pitch_onset = next_same_pitch.get(note.source_id)
+        release_onset = next_onset
+        if held_edge:
+            release_onset = _next_role_onset(
+                note,
+                later_onsets[next_index + 1 :],
+                notes_by_attack,
+            )
+
+        written_duration = note.duration
+        next_attack_distance = (
+            next_onset - note.onset if next_onset is not None else None
+        )
+        column_has_attack_cell = any(
+            other.duration == attack_cell for other in attack_notes
+        )
+        uniform_attack_durations = len(
+            {other.duration for other in attack_notes}
+        ) == 1
+        overlaps_adjacent_attack = (
+            next_attack_distance is not None
+            and next_attack_distance <= attack_cell
+            and written_duration > next_attack_distance
+        )
+        uneven_inner_dotted_value = (
+            written_duration == attack_cell + attack_cell // 2
+            and len(attack_notes) > 1
+            and column_has_attack_cell
+            and not column_edge
+        )
+        repeated_pitch_overlap = (
+            same_pitch_onset is not None
+            and same_pitch_onset < note.onset + written_duration
+        )
+        release_was_normalized = False
+        if (
+            (overlaps_adjacent_attack and not held_edge)
+            or uneven_inner_dotted_value
+            or repeated_pitch_overlap
+        ):
+            capped_duration = attack_cell
+            if next_attack_distance is not None:
+                capped_duration = min(capped_duration, next_attack_distance)
+            if same_pitch_onset is not None:
+                capped_duration = min(capped_duration, same_pitch_onset - note.onset)
+            if 0 < capped_duration < written_duration:
+                written_duration = capped_duration
+                release_was_normalized = True
+                normalized += 1
+
         boundary, _ = _next_metric_boundary(note.end, measures)
-        targets = [
+        current_end = note.onset + written_duration
+        aligned_release_boundary = None
+        if (
+            written_duration >= attack_cell
+            and note.onset % attack_cell == 0
+            and current_end % attack_cell
+        ):
+            aligned_release_boundary = (
+                current_end + attack_cell - current_end % attack_cell
+            )
+        structural_targets = [
             target
-            for target in (next_onset, boundary)
-            if target is not None and target > note.end
+            for target in (release_onset, boundary, same_pitch_onset)
+            if target is not None and target > note.onset
         ]
-        if not targets:
-            result.append(note)
+        if current_end in structural_targets:
+            result.append(replace(note, duration=written_duration))
             continue
-        target = min(targets)
-        gap = target - note.end
-        if gap > maximum_gap:
-            result.append(note)
-            continue
-        result.append(replace(note, duration=target - note.onset))
-        extended += 1
-    return result, extended
+        future_targets = [target for target in structural_targets if target > current_end]
+        if not future_targets:
+            if aligned_release_boundary is None:
+                result.append(replace(note, duration=written_duration))
+                continue
+            target = aligned_release_boundary
+        else:
+            target = min(future_targets)
+        target_duration = target - note.onset
+        gap = target_duration - written_duration
+        release_gap_limit = maximum_gap + (
+            attack_cell // 2 if len(attack_notes) >= 2 else 0
+        )
+        pedal_low_bass = (
+            note.staff == Staff.LEFT
+            and column_edge
+            and note.onset % attack_cell == 0
+            and target_duration % attack_cell == 0
+            and coverage.covers(note.channel, note.onset + written_duration, target)
+        )
+        aligned_edge_value = (
+            written_duration < attack_cell
+            and column_edge
+            and release_onset is not None
+            and target == release_onset
+            and note.onset % attack_cell == 0
+            and target_duration % attack_cell == 0
+            and target_duration <= attack_cell * 2
+        )
+        aligned_release_fill = (
+            aligned_release_boundary is not None
+            and aligned_release_boundary > current_end
+            and aligned_release_boundary - current_end <= attack_cell // 2
+        )
+        monophonic_release = (
+            written_duration >= attack_cell
+            and not release_was_normalized
+            and len(attack_notes) == 1
+            and next_onset is not None
+            and len(next_attack_notes) == 1
+            and target == next_onset
+            and gap <= attack_cell // 2
+        )
+        regular_duration = target_duration // attack_cell * attack_cell
+        aligned_regular_fill = (
+            note.onset % attack_cell == 0
+            and regular_duration > written_duration
+            and regular_duration - written_duration <= release_gap_limit
+            and (
+                column_edge
+                or len(attack_notes) == 1
+                or uniform_attack_durations
+                or (
+                    written_duration >= attack_cell
+                    and not release_was_normalized
+                )
+            )
+        )
+
+        inferred_candidates = [written_duration]
+        if written_duration < attack_cell:
+            inferred_candidates.append(min(target_duration, attack_cell))
+        if (
+            pedal_low_bass
+            or aligned_edge_value
+            or aligned_release_fill
+            or (held_edge and gap <= release_gap_limit)
+            or monophonic_release
+        ):
+            inferred_candidates.append(
+                aligned_release_boundary - note.onset
+                if aligned_release_fill
+                and not (
+                    pedal_low_bass
+                    or aligned_edge_value
+                    or held_edge
+                    or monophonic_release
+                )
+                else target_duration
+            )
+        if aligned_regular_fill:
+            inferred_candidates.append(regular_duration)
+        if (
+            column_edge
+            and target_duration % attack_cell == 0
+            and gap <= maximum_gap
+        ):
+            inferred_candidates.append(target_duration)
+
+        inferred_duration = max(inferred_candidates)
+        if inferred_duration > written_duration:
+            written_duration = inferred_duration
+            extended += 1
+        result.append(replace(note, duration=written_duration))
+    return result, extended, normalized
+
+
+def _is_staff_edge(note: QuantizedNote, attack_notes: list[QuantizedNote]) -> bool:
+    pitches = [other.pitch for other in attack_notes]
+    if note.staff == Staff.RIGHT:
+        return note.pitch == max(pitches)
+    return note.pitch == min(pitches)
+
+
+def _is_held_melodic_edge(
+    note: QuantizedNote,
+    attack_notes: list[QuantizedNote],
+    next_attack_notes: list[QuantizedNote],
+) -> bool:
+    """Preserve a registrally separate melody or bass over accompaniment."""
+
+    if not next_attack_notes or not _is_staff_edge(note, attack_notes):
+        return False
+    if note.staff == Staff.RIGHT:
+        return note.pitch >= max(other.pitch for other in next_attack_notes) + 5
+    return note.pitch <= min(other.pitch for other in next_attack_notes) - 5
+
+
+def _next_role_onset(
+    note: QuantizedNote,
+    later_onsets: list[int],
+    notes_by_attack: dict[tuple[Staff, int], list[QuantizedNote]],
+) -> int | None:
+    """Find the next melody/bass attack while skipping separated accompaniment."""
+
+    maximum_onset = note.onset + CANONICAL_DIVISIONS * 2
+    for onset in later_onsets:
+        if onset > maximum_onset:
+            break
+        attack_notes = notes_by_attack[(note.staff, onset)]
+        if note.staff == Staff.RIGHT:
+            edge_pitch = max(other.pitch for other in attack_notes)
+            if note.pitch - 7 <= edge_pitch <= note.pitch + 12:
+                return onset
+        else:
+            edge_pitch = min(other.pitch for other in attack_notes)
+            if note.pitch - 12 <= edge_pitch <= note.pitch + 7:
+                return onset
+    return None
 
 
 def _extend_release_gaps_to_metric_boundaries(

@@ -158,6 +158,25 @@ def test_secondary_voice_padding_rests_are_hidden() -> None:
     )
 
 
+def test_short_sparse_inner_voice_rest_is_hidden_with_partial_coverage() -> None:
+    notes = [
+        QuantizedNote(1, 76, 0, 720, 80, 0, 0, Staff.RIGHT, 1, hand=Hand.RIGHT),
+        QuantizedNote(2, 79, 960, 480, 80, 0, 0, Staff.RIGHT, 1, hand=Hand.RIGHT),
+        QuantizedNote(3, 64, 240, 240, 76, 0, 0, Staff.RIGHT, 2, hand=Hand.RIGHT),
+        QuantizedNote(4, 67, 960, 240, 76, 0, 0, Staff.RIGHT, 2, hand=Hand.RIGHT),
+    ]
+
+    root = ET.fromstring(score_to_musicxml(_score(notes)))
+    internal_rests = [
+        note
+        for note in root.findall(".//note[staff='1'][voice='2'][rest]")
+        if note.findtext("duration") == "480"
+    ]
+
+    assert internal_rests
+    assert all(rest.get("print-object") == "no" for rest in internal_rests)
+
+
 def test_inferred_rolled_chord_writes_musicxml_arpeggiation() -> None:
     notes = [
         QuantizedNote(

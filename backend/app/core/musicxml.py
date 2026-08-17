@@ -212,7 +212,11 @@ def score_to_musicxml(score: ScoreModel) -> str:
                         ),
                     )
                 )
-            _mark_hidden_padding_rests(staff_sequences, measure_span.duration)
+            _mark_hidden_padding_rests(
+                staff_sequences,
+                measure_span.duration,
+                measure_span.meter,
+            )
             sequences.extend(staff_sequences)
 
         for sequence_index, (staff, voice, items) in enumerate(sequences):
@@ -680,6 +684,7 @@ def _voice_items(
 def _mark_hidden_padding_rests(
     sequences: list[tuple[Staff, int, list[VoiceItem]]],
     measure_length: int,
+    meter: Meter,
 ) -> None:
     sounding_sequences = [
         (voice, items)
@@ -709,8 +714,21 @@ def _mark_hidden_padding_rests(
             rest_end = item.onset + item.duration
             fully_covered = _interval_is_covered(item.onset, rest_end, other_intervals)
             boundary_padding = item.onset == 0 or rest_end == measure_length
-            if fully_covered or boundary_padding or (
-                sparse_voice and other_coverage >= measure_length * 0.65
+            overlap = _overlap_duration(item.onset, rest_end, other_intervals)
+            short_voice_padding = item.duration <= meter.beat_length and (
+                overlap * 2 >= item.duration
+                or other_coverage >= measure_length * 0.45
+            )
+            if (
+                fully_covered
+                or boundary_padding
+                or (sparse_voice and other_coverage >= measure_length * 0.65)
+                or (sparse_voice and short_voice_padding)
+                or (
+                    voice > 1
+                    and short_voice_padding
+                    and other_coverage >= measure_length * 0.55
+                )
             ):
                 item.hidden_rest = True
 
@@ -742,6 +760,20 @@ def _covered_duration(intervals: list[tuple[int, int]]) -> int:
         else:
             merged[-1][1] = max(merged[-1][1], end)
     return sum(end - start for start, end in merged)
+
+
+def _overlap_duration(
+    start: int,
+    end: int,
+    intervals: list[tuple[int, int]],
+) -> int:
+    return _covered_duration(
+        [
+            (max(start, interval_start), min(end, interval_end))
+            for interval_start, interval_end in intervals
+            if interval_start < end and interval_end > start
+        ]
+    )
 
 
 def _stem_directions(
