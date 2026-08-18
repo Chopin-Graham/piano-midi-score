@@ -97,3 +97,53 @@ def test_dynamics_written_into_musicxml() -> None:
     assert dynamics
     first = dynamics[0][0]
     assert first.tag in {"pp", "p", "mp", "mf", "f", "ff"}
+
+
+def test_musescore_loads_score_with_dynamics(tmp_path) -> None:
+    import json
+    import subprocess
+    from pathlib import Path
+
+    import pytest
+
+    from app.core.engraver import find_musescore
+
+    executable = find_musescore()
+    if executable is None:
+        pytest.skip("MuseScore is not installed")
+    meter = Meter(4, 4)
+    measures = [MeasureSpan(index, index * 1920, 1920, meter) for index in range(4)]
+    notes = [
+        QuantizedNote(index + 1, 60 + index, index * 1920, 960, velocity, 0, 0, Staff.RIGHT)
+        for index, velocity in enumerate((50, 60, 90, 95))
+    ]
+    score = ScoreModel(
+        title="Dynamics load",
+        notes=notes,
+        meter=meter,
+        key=KeyEstimate(0, "major", 0, 1.0),
+        tempo_bpm=96,
+        pedals=[],
+        grid_decisions=[],
+        measure_count=4,
+        measures=measures,
+        dynamics=plan_dynamics(notes, measures),
+    )
+    musicxml_path = tmp_path / "dynamics.musicxml"
+    midi_path = tmp_path / "dynamics.mid"
+    job_path = tmp_path / "job.json"
+    musicxml_path.write_text(score_to_musicxml(score), encoding="utf-8")
+    job_path.write_text(
+        json.dumps([{"in": str(musicxml_path), "out": [str(midi_path)]}]),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [str(executable), "-j", str(job_path)],
+        check=False,
+        capture_output=True,
+        timeout=60,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert completed.returncode == 0
+    assert midi_path.is_file()

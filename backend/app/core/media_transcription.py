@@ -278,7 +278,7 @@ def _torch_cuda_available(audio_python: Path) -> bool:
         ],
         check=False,
         capture_output=True,
-        timeout=30,
+        timeout=90,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     return completed.returncode == 0
