@@ -102,7 +102,6 @@ def test_dynamics_written_into_musicxml() -> None:
 def test_musescore_loads_score_with_dynamics(tmp_path) -> None:
     import json
     import subprocess
-    from pathlib import Path
 
     import pytest
 

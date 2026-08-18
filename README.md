@@ -102,7 +102,7 @@ npm run build --prefix frontend
 npm audit --prefix frontend --audit-level=moderate
 ```
 
-当前验证基线（2026-08-18）：后端 156 项测试全部通过；Ruff 通过；前端 5 项测试、TypeScript 类型检查和生产构建通过。音频/视频全链路新增回环验收：转录 MIDI 经 MuseScore 回读的起音 F1 为 0.9967（0.12 拍容差，含弱起重组偏移校正），成谱合成音频与原录音的 CENS 色度相似度 0.74；29 个真实下载 MIDI 的全量语义门禁与历史基线一致（0 同声部重叠、0 谱表误放新增）。
+当前验证基线（2026-08-18）：后端 156 项测试全部通过；Ruff 通过；前端 5 项测试、TypeScript 类型检查和生产构建通过。音频/视频全链路新增回环验收：转录 MIDI 经 MuseScore 回读的起音 F1 为 0.9967（0.12 拍容差，含弱起重组偏移校正），成谱合成音频与原录音的 CENS 色度相似度 0.82；29 个真实下载 MIDI 的全量语义门禁与历史基线一致（0 同声部重叠、0 谱表误放新增）。
 
 复杂回归样例位于 `artifacts/regression-expressive-piano.mid`，最终验收产物位于 `output/pdf/` 和 `artifacts/`。
 
