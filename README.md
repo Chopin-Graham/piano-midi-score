@@ -22,6 +22,7 @@
 - 按雕版节奏列和声部密度安排每行小节数，常规目标为 2–6 小节；分页交给 MuseScore 的实际碰撞结果，避免空白页。
 - 只对完整极端音区乐句使用 8va/8vb，并同步移写书写音高；过短八度线保留加线，避免孤立标签造成误读。
 - 提供 Leland 经典、Bravura 现代和 Leland 紧凑三种用户可选 A4 雕版风格。
+- 从力度统计自动规划谱面力度记号（相对本曲中位数映射 pp–ff、两小节最短持续、平值力度文件不标注），可手动关闭。
 - MuseScore Studio 4 负责最终的 A4 间距、碰撞规避、分页与 PDF 导出。
 - MuseScore 不可用时仍返回 MusicXML，并由 OpenSheetMusicDisplay 提供网页回退预览。
 - 音频/视频通过 FFmpeg 抽取 44.1 kHz 单声道 PCM；默认用 Transkun 钢琴专用模型，Basic Pitch 作为 Windows 兼容降级路径。

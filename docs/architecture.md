@@ -41,6 +41,7 @@ MuseScore 不可用时，流程在 MusicXML 处安全降级，网页使用 OpenS
 | `piano_rules.py` | 标准钢琴音域、手距、琴键几何、五指规则和踏板覆盖区间的单一事实来源 |
 | `duration_simplifier.py` | 将踏板或演奏造成的轻微重叠规范成可写时值；音频模式还把碎小释放间隙延至下一起音/节拍边界，始终保留全部音头；释放单元随小节网格（含三连音）自适应 |
 | `ornaments.py` | 转录装饰音识别：快速二度严格交替合并为颤音记号；拍前碎音在多重证据一致时按倚音记谱并归还时值 |
+| `dynamics.py` | 从力度统计规划谱面力度记号：相对本曲中位数映射、两小节最短持续、平值力度不标注 |
 | `key_detection.py` | Krumhansl 调性估计；无调号事件时按滑动窗口 + Viterbi 平滑 + 短段坍缩生成小节级调号时间线 |
 | `voices.py` | 以 Partitura Chew–Wu 结果作为旋律路径提示，再做无重叠区间打包 |
 | `spelling.py` | 使用 Partitura PS13 生成上下文相关的音名和临时升降号 |
