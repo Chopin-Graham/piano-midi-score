@@ -219,6 +219,13 @@ class KeyChange:
 
 
 @dataclass(frozen=True, slots=True)
+class DynamicMark:
+    measure_index: int
+    mark: str
+    velocity_percent: float
+
+
+@dataclass(frozen=True, slots=True)
 class GridDecision:
     measure_index: int
     name: str
@@ -241,6 +248,7 @@ class ScoreModel:
     measures: list[MeasureSpan] = field(default_factory=list)
     clef_changes: list[ClefChange] = field(default_factory=list)
     key_changes: list[KeyChange] = field(default_factory=list)
+    dynamics: list[DynamicMark] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 

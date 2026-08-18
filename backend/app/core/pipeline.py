@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .clefs import plan_clefs
 from .duration_simplifier import simplify_polyphonic_durations
+from .dynamics import plan_dynamics
 from .hand_splitter import (
     assign_hands,
     mark_unredistributable_chords_for_arpeggiation,
@@ -202,6 +203,7 @@ def convert_midi_with_score(
         measures,
         responsive=options.audio_transcription,
     )
+    dynamics = plan_dynamics(notes, measures) if options.include_dynamics else []
     quality, quality_warnings = evaluate_notation_quality(
         notes,
         expected_note_count=quantized_note_count,
@@ -235,6 +237,7 @@ def convert_midi_with_score(
         measures=measures,
         clef_changes=clef_changes,
         key_changes=key_changes,
+        dynamics=dynamics,
         warnings=warnings,
     )
     musicxml = score_to_musicxml(score)
@@ -288,6 +291,13 @@ def convert_midi_with_score(
         },
         "spelling": spelling_analysis,
         "notation": notation_analysis,
+        "dynamics": {
+            "marks": len(dynamics),
+            "sequence": [
+                {"measure": mark.measure_index + 1, "mark": mark.mark}
+                for mark in dynamics
+            ],
+        },
         "engraving_style": options.engraving_style,
         "quality": quality,
         "semantic_engine": {

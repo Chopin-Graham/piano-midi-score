@@ -9,6 +9,7 @@ from .meter_map import measure_index_at
 from .models import (
     CANONICAL_DIVISIONS,
     ClefChange,
+    DynamicMark,
     Hand,
     KeyEstimate,
     Meter,
@@ -146,6 +147,9 @@ def score_to_musicxml(score: ScoreModel) -> str:
     # the engraver decide horizontal layout from the final glyph geometry.
     break_before: set[int] = set()
     pedal_by_measure = _pedals_by_measure(score)
+    dynamics_by_measure: dict[int, list[DynamicMark]] = defaultdict(list)
+    for mark in score.dynamics:
+        dynamics_by_measure[mark.measure_index].append(mark)
     clefs_by_measure: dict[int, list[ClefChange]] = defaultdict(list)
     for clef_change in score.clef_changes:
         clefs_by_measure[clef_change.measure_index].append(clef_change)
@@ -194,6 +198,9 @@ def score_to_musicxml(score: ScoreModel) -> str:
 
         for offset, down in pedal_by_measure.get(measure_index, []):
             _add_pedal(measure, offset, down)
+
+        for dynamic_mark in dynamics_by_measure.get(measure_index, []):
+            _add_dynamic(measure, dynamic_mark)
 
         _add_positioned_octave_shifts(
             measure,
@@ -438,6 +445,16 @@ def _add_pedal(measure: ET.Element, offset: int, down: bool) -> None:
     if offset:
         ET.SubElement(direction, "offset", sound="yes").text = str(offset)
     ET.SubElement(direction, "staff").text = "2"
+
+
+def _add_dynamic(measure: ET.Element, mark: DynamicMark) -> None:
+    # Between the staves is the conventional piano-score dynamic position.
+    direction = ET.SubElement(measure, "direction", placement="below")
+    direction_type = ET.SubElement(direction, "direction-type")
+    dynamics = ET.SubElement(direction_type, "dynamics")
+    ET.SubElement(dynamics, mark.mark)
+    ET.SubElement(direction, "sound", dynamics=str(mark.velocity_percent))
+    ET.SubElement(direction, "staff").text = "1"
 
 
 def _add_octave_shift(

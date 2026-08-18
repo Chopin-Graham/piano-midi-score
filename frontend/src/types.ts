@@ -13,6 +13,7 @@ export interface ConversionOptions {
   prefer_track_hints: boolean;
   max_voices_per_staff: 1 | 2;
   include_pedal: boolean;
+  include_dynamics: boolean;
   infer_key: boolean;
   time_numerator: number | null;
   time_denominator: 2 | 4 | 8 | 16 | null;

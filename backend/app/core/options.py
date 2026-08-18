@@ -16,6 +16,7 @@ class ConversionOptions(BaseModel):
     prefer_track_hints: bool = True
     max_voices_per_staff: int = Field(default=2, ge=1, le=2)
     include_pedal: bool = True
+    include_dynamics: bool = True
     infer_key: bool = True
     time_numerator: int | None = Field(default=None, ge=1, le=12)
     time_denominator: Literal[2, 4, 8, 16] | None = None

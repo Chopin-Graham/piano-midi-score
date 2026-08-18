@@ -29,6 +29,7 @@ const DEFAULT_OPTIONS: ConversionOptions = {
   prefer_track_hints: true,
   max_voices_per_staff: 2,
   include_pedal: true,
+  include_dynamics: true,
   infer_key: true,
   time_numerator: null,
   time_denominator: null,
@@ -320,6 +321,11 @@ export default function App() {
                 label="保留踏板线"
                 checked={options.include_pedal}
                 onChange={(include_pedal) => setOptions({ ...options, include_pedal })}
+              />
+              <Toggle
+                label="力度记号"
+                checked={options.include_dynamics}
+                onChange={(include_dynamics) => setOptions({ ...options, include_dynamics })}
               />
               <Toggle
                 label="优先使用轨道分手"
