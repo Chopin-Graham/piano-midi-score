@@ -289,7 +289,8 @@ def _grid_candidates(options: ConversionOptions, meter: Meter | None = None) -> 
         allowed = {spec.name for spec in all_specs}
 
     if not options.allow_triplets:
-        allowed = {name for name in allowed if "triplet" not in name}
+        triplet_names = {spec.name for spec in all_specs if spec.triplet}
+        allowed = {name for name in allowed if name not in triplet_names}
     if meter is not None and meter.is_compound:
         # In 6/8, 9/8 and 12/8 the written dotted beat already expresses ternary
         # subdivision. Treating ordinary eighths as quarter-note triplets creates

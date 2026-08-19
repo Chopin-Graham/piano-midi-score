@@ -4,7 +4,7 @@ from collections import defaultdict
 from statistics import median
 
 from .meter_map import measure_index_at
-from .models import ClefChange, MeasureSpan, QuantizedNote, Staff
+from .models import CANONICAL_DIVISIONS, ClefChange, MeasureSpan, QuantizedNote, Staff
 
 CLEF_CHANGE_PENALTY = 6.5
 MID_MEASURE_CLEF_PENALTY = 3.25
@@ -124,6 +124,34 @@ def clef_kind_at(
     return selected
 
 
+def _beamed_run_spans(activity: list[tuple[int, int, int]]) -> list[tuple[int, int]]:
+    """Spans of continuous runs of three or more short (<= eighth) notes."""
+
+    segments = sorted(activity)
+    runs: list[tuple[int, int]] = []
+    run_start: int | None = None
+    run_end = 0
+    members = 0
+    for start, end, _ in segments:
+        if end - start > CANONICAL_DIVISIONS // 2:
+            if members >= 3:
+                runs.append((run_start, run_end))
+            run_start = None
+            members = 0
+            continue
+        if run_start is None or start > run_end:
+            if members >= 3:
+                runs.append((run_start, run_end))
+            run_start = start
+            members = 1
+        else:
+            members += 1
+        run_end = max(run_end, end)
+    if members >= 3 and run_start is not None:
+        runs.append((run_start, run_end))
+    return runs
+
+
 def _delayed_change_offset(
     activity: list[tuple[int, int, int]],
     measure_duration: int,
@@ -150,6 +178,23 @@ def _delayed_change_offset(
     )
     if not candidates:
         return 0
+    run_spans = _beamed_run_spans(activity)
+    if run_spans:
+        # A clef change inside a tuplet or a continuous beamed run splits the
+        # figure visually; move the change to the run's end instead.
+        sheltered = [
+            point
+            for point in candidates
+            if not any(start < point < end for start, end in run_spans)
+        ]
+        run_ends = {
+            end
+            for start, end in run_spans
+            if minimum_side <= end <= measure_duration - minimum_side
+        }
+        candidates = sorted(set(sheltered) | run_ends)
+        if not candidates:
+            return 0
 
     boundary_cost = _timed_clef_cost(activity, next_kind, 0, measure_duration)
     best_offset = 0

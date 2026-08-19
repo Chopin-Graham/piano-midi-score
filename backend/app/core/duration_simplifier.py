@@ -589,3 +589,69 @@ def _active_importance(notes: list[QuantizedNote], staff: Staff) -> float:
     center = sum(note.pitch for note in notes) / len(notes)
     register = center if staff == Staff.RIGHT else -center
     return duration + register * 2.0
+
+
+def normalize_short_gate_slots(
+    notes: list[QuantizedNote],
+    measures: list[MeasureSpan],
+) -> tuple[list[QuantizedNote], int]:
+    """Normalize short-gate articulation to readable slot values + staccato.
+
+    Some MIDI sources encode articulation as short gate times: a staccato
+    sixteenth arrives as a 32nd-long keypress (about half the slot).  Printed
+    literally, that is a 32nd note trailing 16th/32nd rests — visual noise
+    that misreads the articulation.  When a note sounds for at most ~55% of
+    the time until the next attack in its voice, engravers write a plain
+    slot value with a staccato dot instead: the written duration doubles to
+    the clean binary value at most half the slot, the dot says "play short".
+    Notes inside runs (no gap after them) and ratio-grid (tuplet) members
+    stay untouched.
+    """
+
+    lane_attacks: dict[tuple[object, int], list[int]] = defaultdict(list)
+    for note in notes:
+        if note.staff is not None:
+            lane_attacks[(note.staff, note.voice)].append(note.onset)
+    for lane in lane_attacks:
+        lane_attacks[lane] = sorted(set(lane_attacks[lane]))
+
+    adjusted = 0
+    result: list[QuantizedNote] = []
+    for note in notes:
+        if note.staff is None or note.grace or note.trill or note.tremolo_start or note.tremolo_stop:
+            result.append(note)
+            continue
+        if note.duration % 30 or note.duration >= CANONICAL_DIVISIONS // 2:
+            result.append(note)
+            continue
+        attacks = lane_attacks.get((note.staff, note.voice), [])
+        following = [onset for onset in attacks if onset > note.onset]
+        if not following:
+            result.append(note)
+            continue
+        slot = min(following) - note.onset
+        if slot <= note.duration:
+            result.append(note)
+            continue
+        if note.duration * 20 > slot * 11:  # gate longer than ~55% of the slot
+            result.append(note)
+            continue
+        target = slot // 2
+        clean = [v for v in _CLEAN_BINARY if v <= target]
+        if not clean:
+            result.append(note)
+            continue
+        written = max(clean)
+        if written <= note.duration or written % 30:
+            result.append(note)
+            continue
+        result.append(replace(note, duration=written, staccato=True))
+        adjusted += 1
+
+    return (
+        sorted(result, key=lambda note: (note.onset, note.pitch, note.source_id)),
+        adjusted,
+    )
+
+
+_CLEAN_BINARY = (480, 360, 240, 180, 120, 90, 60, 30)

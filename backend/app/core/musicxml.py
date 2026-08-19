@@ -13,6 +13,7 @@ from .models import (
     DynamicMark,
     Hand,
     KeyEstimate,
+    MeasureSpan,
     Meter,
     QuantizedNote,
     ScoreModel,
@@ -94,6 +95,13 @@ DURATION_SPECS = [
 ]
 SPEC_BY_VALUE = {spec.value: spec for spec in DURATION_SPECS}
 
+# Plain (ratio-free) spec values, largest first: the only safe choices when a
+# free note's duration must be coerced — a ratio spec on an unbracketed note
+# hangs importers, and a mismatched spec corrupts the measure.
+_PLAIN_SPEC_VALUES = tuple(
+    sorted((spec.value for spec in DURATION_SPECS if spec.time_modification is None), reverse=True)
+)
+
 # Specs without a time ratio: the only safe choices for decomposing an
 # arbitrary span.  Picking a tuplet spec for an unrelated binary duration
 # prints a ratio where none belongs (a "5:4 quarter" rest for 400 ticks) and
@@ -167,6 +175,9 @@ def score_to_musicxml(score: ScoreModel) -> str:
     _add_part_list(root)
 
     part = ET.SubElement(root, "part", id="P1")
+    grid_steps = {
+        decision.measure_index: decision.step for decision in score.grid_decisions
+    }
     ottava_spans = detect_ottava_spans(score.notes)
     atoms = _notation_atoms(score.notes, score, ottava_spans)
     atoms_by_location: dict[tuple[int, Staff, int], list[NotationNote]] = defaultdict(list)
@@ -274,6 +285,8 @@ def score_to_musicxml(score: ScoreModel) -> str:
                             measure_span.start,
                             measure_span.duration,
                             measure_span.meter,
+                            measure_span.implicit,
+                            grid_steps.get(measure_index),
                         ),
                     )
                 )
@@ -712,6 +725,33 @@ def _notation_atoms(
     return sorted(atoms, key=lambda atom: (atom.onset, atom.staff, atom.voice, atom.pitch))
 
 
+def _gap_fillable(duration: int) -> bool:
+    return duration == 0 or _exactly_decomposable(duration)
+
+
+def _grid_step_at(score: ScoreModel, tick: int) -> int | None:
+    if not score.grid_decisions:
+        return None
+    index = measure_index_at(score.measures, tick)
+    for decision in score.grid_decisions:
+        if decision.measure_index == index:
+            return decision.step
+    return None
+
+
+def _within_beat(relative: int, measure: MeasureSpan) -> int:
+    """Position within the current beat, end-aligned for pickup measures.
+
+    A pickup (implicit) measure's beats hang off its end — the first full
+    barline is the phase reference — not off its start.
+    """
+
+    beat = measure.meter.beat_length
+    if measure.implicit:
+        return (relative - (measure.start + measure.duration)) % beat
+    return relative % beat
+
+
 def _split_note_across_measures(
     onset: int,
     duration: int,
@@ -726,6 +766,15 @@ def _split_note_across_measures(
         to_measure_end = measure.end - current
         if to_measure_end <= 0:
             raise ValueError(f"音符位置 {current} 超出小节时间轴")
+        if remaining > to_measure_end > 0 and to_measure_end < CANONICAL_DIVISIONS // 16:
+            # A fragment this small before the barline cannot be printed:
+            # start the written note on the barline instead.
+            remaining -= to_measure_end
+            current = measure.end
+            continue
+        if relative == 0 and 0 < remaining < CANONICAL_DIVISIONS // 16:
+            # Likewise for a hair of sound trailing into the next measure.
+            break
         available = min(remaining, to_measure_end)
 
         # A complete 6/8 bar is conventionally one dotted half, not two dotted
@@ -744,11 +793,22 @@ def _split_note_across_measures(
                 _distance_to_next_group(relative, measure.duration, measure.meter),
             )
         else:
-            within_beat = relative % measure.meter.beat_length
+            within_beat = _within_beat(relative, measure)
             if within_beat:
                 available = min(available, measure.meter.beat_length - within_beat)
 
-        piece = _choose_duration_clean(available)
+        grid_step = _grid_step_at(score, current)
+        piece = _choose_duration_clean(available, grid_step)
+        # A leftover smaller than a 64th note cannot be printed.  Let the note
+        # cross this beat (never barline) boundary by that hair instead of
+        # splitting off a fragment no note type can display.
+        tail = remaining - piece
+        if (
+            0 < tail < CANONICAL_DIVISIONS // 16
+            and piece + tail in SPEC_BY_VALUE
+            and to_measure_end > available
+        ):
+            piece += tail
         pieces.append((current, piece))
         current += piece
         remaining -= piece
@@ -756,7 +816,12 @@ def _split_note_across_measures(
 
 
 def _split_readable_span(
-    onset: int, duration: int, measure_length: int, meter: Meter
+    onset: int,
+    duration: int,
+    measure_length: int,
+    meter: Meter,
+    implicit: bool = False,
+    grid_step: int | None = None,
 ) -> list[tuple[int, int]]:
     pieces: list[tuple[int, int]] = []
     current = onset
@@ -773,10 +838,13 @@ def _split_readable_span(
             )
         else:
             within_beat = relative % meter.beat_length
+            if implicit:
+                beat = meter.beat_length
+                within_beat = (relative - measure_length % beat) % beat
             if within_beat:
                 available = min(available, meter.beat_length - within_beat)
 
-        piece = _choose_duration_clean(available)
+        piece = _choose_duration_clean(available, grid_step)
         pieces.append((current, piece))
         current += piece
         remaining -= piece
@@ -812,20 +880,32 @@ def _exactly_decomposable(duration: int) -> bool:
     )
 
 
-def _choose_duration_clean(available: int) -> int:
+def _choose_duration_clean(available: int, grid_step: int | None = None) -> int:
     """Largest exact piece, shrunk until the remaining tail also decomposes.
 
     Greedy largest-first selection can strand a sub-grid tail (100 = 90 + 10,
     and 10 has no note type).  Shrinking the chosen piece one step (60 + 40)
-    keeps every piece exactly representable.
+    keeps every piece exactly representable.  The candidate pool follows the
+    measure's grid: ratio members split into their own kind, plain content
+    stays binary.
     """
 
-    piece = _choose_duration(available)
+    pool = _spec_values_for_grid(grid_step)
+
+    def choose(avail: int) -> int:
+        if avail in SPEC_BY_VALUE:
+            return avail
+        for value in pool:
+            if value <= avail:
+                return value
+        return avail
+
+    piece = choose(available)
     if piece == available or piece not in SPEC_BY_VALUE:
         return piece
     tail = available - piece
     while tail and not _exactly_decomposable(tail):
-        smaller = next((spec.value for spec in BINARY_SPECS if spec.value < piece), None)
+        smaller = next((value for value in pool if value < piece), None)
         if smaller is None:
             break
         piece = smaller
@@ -838,6 +918,8 @@ def _voice_items(
     measure_start: int,
     measure_length: int,
     meter: Meter,
+    implicit: bool = False,
+    grid_step: int | None = None,
 ) -> list[VoiceItem]:
     if not atoms:
         return [
@@ -861,7 +943,14 @@ def _voice_items(
         if target in timed_onsets:
             attachable.append(grace)
         else:
-            demoted.append(replace(grace, grace=False))
+            # A demoted grace becomes a plain note; keep its duration printable.
+            demoted.append(
+                replace(
+                    grace,
+                    grace=False,
+                    duration=max(grace.duration, CANONICAL_DIVISIONS // 16),
+                )
+            )
     if demoted:
         timed_atoms = sorted(
             [*timed_atoms, *demoted],
@@ -875,34 +964,59 @@ def _voice_items(
     items: list[VoiceItem] = []
     cursor = 0
     for (onset, duration), chord_notes in sorted(grouped.items()):
+        gap = onset - cursor
+        if gap > 0 and not _gap_fillable(gap):
+            # A sub-grid seam between buckets would become an unprintable
+            # rest; pull the attack a hair earlier so the gap fills cleanly.
+            for shift in range(1, min(gap, CANONICAL_DIVISIONS // 16) + 1):
+                if _gap_fillable(gap - shift):
+                    onset -= shift
+                    break
+            else:
+                onset = cursor
         if onset > cursor:
-            items.extend(_rest_items(cursor, onset - cursor, measure_length, meter))
+            items.extend(_rest_items(cursor, onset - cursor, measure_length, meter, implicit, grid_step))
         if onset < cursor:
-            # Never fail the whole conversion on a same-voice overlap: fold a
-            # same-attack arrival into the open chord, clip the previous
-            # item's tail to the largest printable value, or — when the
-            # overlap is shorter than any note type — merge it into the chord.
+            # Never fail the whole conversion on a same-voice overlap, and
+            # never lose timeline coverage either: every path keeps the
+            # voice's total time intact.
             previous = items[-1] if items else None
-            if previous is not None and not previous.is_rest:
+            if previous is not None and previous.is_rest:
+                # Shrink the gap-fill to end exactly at this attack.
+                shrunk = onset - previous.onset
+                if shrunk > 0:
+                    previous.duration = shrunk
+                    previous.spec = SPEC_BY_VALUE.get(
+                        shrunk, DurationSpec(shrunk, "64th")
+                    )
+                else:
+                    items.pop()
+                cursor = onset
+            elif previous is not None and previous.onset == onset:
+                # Same attack, another length: fold into the open chord.
+                previous.notes.extend(chord_notes)
+                previous.notes.sort(key=lambda note: note.pitch)
+                continue
+            elif previous is not None:
                 clipped = onset - previous.onset
                 exact = max(
                     (value for value in SPEC_BY_VALUE if value <= clipped),
                     default=0,
                 )
-                if previous.onset != onset and exact:
+                if exact:
                     previous.duration = exact
                     previous.spec = SPEC_BY_VALUE[exact]
                     cursor = previous.onset + exact
                 else:
+                    # Overlap shorter than any note type: merge into the chord.
                     previous.notes.extend(chord_notes)
                     previous.notes.sort(key=lambda note: note.pitch)
                     continue
-            else:
-                items.pop() if previous is not None else None
-                cursor = items[-1].onset + items[-1].duration if items else 0
         if onset < cursor:
+            # Unreachable by construction; kept as a final guard so a bad
+            # overlap can never abort the conversion.
             continue
-        spec = SPEC_BY_VALUE.get(duration, DurationSpec(duration, "64th"))
+        spec = _spec_for_value(duration, grid_step)
         items.append(
             VoiceItem(
                 onset=onset,
@@ -914,7 +1028,7 @@ def _voice_items(
         cursor = onset + duration
 
     if cursor < measure_length:
-        items.extend(_rest_items(cursor, measure_length - cursor, measure_length, meter))
+        items.extend(_rest_items(cursor, measure_length - cursor, measure_length, meter, implicit, grid_step))
     for item in items:
         if item.is_rest and (item.onset == 0 or item.onset + item.duration == measure_length):
             item.boundary_rest = True
@@ -925,6 +1039,11 @@ def _voice_items(
         )
     items = _complete_tuplet_groups(items, meter)
     items = _rescue_stranded_ratio_notes(items)
+    if _stream_coherent(items, measure_length):
+        items = _snap_free_onsets(items, measure_length, meter, implicit, grid_step)
+    if _stream_coherent(items, measure_length):
+        items = _enforce_tuplet_group_integrity(items, measure_length, meter, implicit, grid_step)
+    items = _reconcile_voice_stream(items, measure_length, meter, implicit, grid_step)
     _mark_beams(items, meter)
     for grace in attachable:
         target = grace.onset + grace.duration - measure_start
@@ -933,6 +1052,20 @@ def _voice_items(
                 item.grace_notes.append(grace)
                 break
     return items
+
+
+def _stream_coherent(items: list[VoiceItem], measure_length: int) -> bool:
+    """Sorted, contiguous, and inside the measure — the layout assumption the
+    snapping/integrity passes work under.  Donor moves in the rescue passes
+    can occasionally leave a voice disordered; such a stream must go straight
+    to the reconciler, which tolerates any input."""
+
+    cursor = 0
+    for item in items:
+        if item.onset != cursor or item.duration <= 0:
+            return False
+        cursor += item.duration
+    return cursor == measure_length
 
 
 def _rescue_stranded_ratio_notes(items: list[VoiceItem]) -> list[VoiceItem]:
@@ -997,7 +1130,96 @@ def _rescue_stranded_ratio_notes(items: list[VoiceItem]) -> list[VoiceItem]:
                     break
         # If no adjacent rest can donate, the note stays as written; the batch
         # render gate flags any score where that still happens.
-    return _rescue_stranded_ratio_runs(result)
+    return _rescue_stranded_ratio_runs(_rescue_with_distant_donors(result))
+
+
+def _rescue_with_distant_donors(items: list[VoiceItem]) -> list[VoiceItem]:
+    """Donate a stranded member's re-notation delta from any rest in the voice.
+
+    The adjacent-rest rescue has nothing to work with when a stranded note
+    sits between two notes — so search the whole voice for a padding rest
+    that can absorb the delta and stay exactly representable.  All edits go
+    through indexed replacement (never value-based removal): equal rests
+    occur naturally and removing the wrong one would open a time hole.
+    """
+
+    def free_donor(entry: VoiceItem) -> bool:
+        return (
+            entry.is_rest
+            and not entry.measure_rest
+            and not entry.in_tuplet
+            and not entry.tuplet_start
+            and not entry.tuplet_stop
+        )
+
+    work = list(items)
+    index = 0
+    while index < len(work):
+        item = work[index]
+        if item.is_rest or not item.spec.time_modification or item.in_tuplet:
+            index += 1
+            continue
+        next_note_end = next(
+            (
+                entry.onset
+                for entry in work[index + 1 :]
+                if not entry.is_rest
+            ),
+            None,
+        )
+        candidates = sorted(
+            (spec.value for spec in BINARY_SPECS if spec.value != item.duration),
+            key=lambda value: (abs(value - item.duration), value),
+        )
+        for target in candidates:
+            delta = target - item.duration
+            if delta > 0 and next_note_end is not None and item.onset + target > next_note_end:
+                # Extending into the next attack would overlap it — try a
+                # shorter plain value instead.
+                continue
+            best = None
+            for donor_index, donor in enumerate(work):
+                if donor_index == index or not free_donor(donor):
+                    continue
+                if delta > 0:
+                    leftover = donor.duration - delta
+                    if leftover != 0 and leftover not in SPEC_BY_VALUE:
+                        continue
+                    score = (abs(donor.onset - item.onset), donor_index)
+                    if best is None or score < best[0]:
+                        best = (score, donor_index, leftover)
+                else:
+                    widened = donor.duration - delta
+                    if widened not in SPEC_BY_VALUE:
+                        continue
+                    score = (abs(donor.onset - item.onset), donor_index)
+                    if best is None or score < best[0]:
+                        best = (score, donor_index, widened)
+            if best is None:
+                continue
+            _, donor_index, remainder = best
+            donor = work[donor_index]
+            if delta > 0:
+                if remainder:
+                    work[donor_index] = replace(
+                        donor,
+                        onset=donor.onset + delta,
+                        duration=remainder,
+                        spec=SPEC_BY_VALUE[remainder],
+                    )
+                else:
+                    work.pop(donor_index)
+                    if donor_index < index:
+                        index -= 1
+            else:
+                work[donor_index] = replace(
+                    donor, duration=remainder, spec=SPEC_BY_VALUE[remainder]
+                )
+            item.duration = target
+            item.spec = SPEC_BY_VALUE[target]
+            break
+        index += 1
+    return work
 
 
 def _rescue_stranded_ratio_runs(items: list[VoiceItem]) -> list[VoiceItem]:
@@ -1029,6 +1251,10 @@ def _rescue_stranded_ratio_runs(items: list[VoiceItem]) -> list[VoiceItem]:
 
         freed = 0
         converted: list[VoiceItem] = []
+        # Repack the converted members contiguously from the run's attack:
+        # shrinking each member in place would leave a sub-grid hole between
+        # neighbours, and no rest type can fill those cracks.
+        pack_cursor = run[0].onset
         for member in run:
             if member.is_rest:
                 freed += member.duration
@@ -1040,10 +1266,12 @@ def _rescue_stranded_ratio_runs(items: list[VoiceItem]) -> list[VoiceItem]:
             if plain is None:
                 plain = min(spec.value for spec in BINARY_SPECS)
             freed += member.duration - plain
+            member.onset = pack_cursor
             member.duration = plain
             member.spec = SPEC_BY_VALUE[plain]
             member.beam = None
             converted.append(member)
+            pack_cursor += plain
         if freed < 0:
             donor = result[-1] if result else None
             if (
@@ -1061,6 +1289,20 @@ def _rescue_stranded_ratio_runs(items: list[VoiceItem]) -> list[VoiceItem]:
             # No padding anywhere can cover the extension: keep the run as-is.
             result.extend(run)
         else:
+            # Keep the padding rest on a plain binary value: shrink one
+            # converted note another step until the remainder is clean.
+            binary_values = sorted({spec.value for spec in BINARY_SPECS})
+            while converted and freed and freed not in binary_values:
+                last = converted[-1]
+                smaller = max(
+                    (value for value in binary_values if value < last.duration),
+                    default=None,
+                )
+                if smaller is None:
+                    break
+                freed += last.duration - smaller
+                last.duration = smaller
+                last.spec = SPEC_BY_VALUE[smaller]
             result.extend(converted)
             if freed:
                 onset = run[0].onset
@@ -1214,20 +1456,71 @@ def _stem_directions(
 
 
 def _rest_items(
-    onset: int, duration: int, measure_length: int, meter: Meter
+    onset: int,
+    duration: int,
+    measure_length: int,
+    meter: Meter,
+    implicit: bool = False,
+    grid_step: int | None = None,
 ) -> list[VoiceItem]:
     return [
         VoiceItem(
             onset=piece_onset,
             duration=piece_duration,
-            spec=SPEC_BY_VALUE.get(piece_duration, DurationSpec(piece_duration, "64th")),
+            spec=_spec_for_value(piece_duration, grid_step),
             notes=[],
             is_rest=True,
         )
         for piece_onset, piece_duration in _split_readable_span(
-            onset, duration, measure_length, meter
+            onset, duration, measure_length, meter, implicit, grid_step
         )
     ]
+
+
+def _spec_values_for_grid(grid_step: int | None) -> list[int]:
+    """Duration values legitimate on the measure's grid: binary values always,
+    plus the member units of the grid's ratio family.  Without grid context,
+    triplet and sextuplet members stay available (a 400-tick note only splits
+    cleanly as 320+80); the exotic quintuplet family joins only on its own
+    grid, where it is actually meant.
+    """
+
+    values = [spec.value for spec in BINARY_SPECS]
+    ratio_by_step = {
+        CANONICAL_DIVISIONS // 3: [(3, 2)],
+        CANONICAL_DIVISIONS // 6: [(6, 4)],
+        CANONICAL_DIVISIONS // 12: [(6, 4)],
+        CANONICAL_DIVISIONS // 5: [(5, 4)],
+        CANONICAL_DIVISIONS // 10: [(5, 4)],
+    }
+    families = ratio_by_step.get(grid_step or 0)
+    if families is None:
+        families = [(3, 2), (6, 4)] if grid_step is None else []
+    for ratio in families:
+        values += list(TUPLET_MEMBER_SPECS[ratio])
+    return sorted(set(values), reverse=True)
+
+
+def _spec_for_value(duration: int, grid_step: int | None) -> DurationSpec:
+    """Pick the duration spec, resolving ratio ambiguity by the local grid.
+
+    Values 80/160/240 live in more than one ratio world: an 80 is a 16th
+    sextuplet member on a sextuplet grid but a 16th-triplet member on an
+    eighth-triplet grid.  The measure's chosen grid decides.  A value with a
+    plain spec (240 = a plain eighth) keeps it: tuplet group completion
+    re-specs genuine members, and a stray ratio spec would only send the
+    rescue passes hunting for time that was never missing.
+    """
+
+    plain = SPEC_BY_VALUE.get(duration)
+    if plain is not None and plain.time_modification is None:
+        return plain
+    if duration in TUPLET_MEMBER_SPECS[(3, 2)] and duration in TUPLET_MEMBER_SPECS[(6, 4)]:
+        if grid_step == CANONICAL_DIVISIONS // 3:
+            return TUPLET_MEMBER_SPECS[(3, 2)][duration]
+        if grid_step in (CANONICAL_DIVISIONS // 6, CANONICAL_DIVISIONS // 12):
+            return TUPLET_MEMBER_SPECS[(6, 4)][duration]
+    return SPEC_BY_VALUE.get(duration, DurationSpec(duration, "64th"))
 
 
 def _complete_tuplet_groups(items: list[VoiceItem], meter: Meter) -> list[VoiceItem]:
@@ -1257,7 +1550,14 @@ def _complete_tuplet_groups(items: list[VoiceItem], meter: Meter) -> list[VoiceI
         return (480, 960) if group_mod == (6, 4) else (240, 480, 960)
 
     def is_complete() -> bool:
-        return bool(group) and group_sum in complete_spans()
+        if not group or group_sum not in complete_spans():
+            return False
+        smallest = min(member.duration for member in group)
+        if group_sum % smallest:
+            return False
+        count = group_sum // smallest
+        valid_counts = {(3, 2): (3, 6, 12), (6, 4): (6, 12), (5, 4): (5, 10)}
+        return count in valid_counts[group_mod]
 
     def absorb_backward() -> None:
         nonlocal group_sum
@@ -1280,7 +1580,10 @@ def _complete_tuplet_groups(items: list[VoiceItem], meter: Meter) -> list[VoiceI
             absorbed = _member_unit_split(min(needed, tail.duration), group_mod)
             if absorbed is None:
                 return
-            onset = tail.onset
+            # Carve the absorbed time off the tail's END, right against the
+            # group: the new members then sit adjacent to the group's first
+            # item, and the untouched remainder keeps the tail's onset.
+            onset = tail.onset + tail.duration - sum(absorbed)
             pieces = []
             for part in absorbed:
                 pieces.append(
@@ -1406,6 +1709,9 @@ def _complete_tuplet_groups(items: list[VoiceItem], meter: Meter) -> list[VoiceI
         index += 1
 
     close_group()
+    # Backward absorption can reorder items; the measure stream must stay
+    # onset-monotonic or importers lose the timeline.
+    result.sort(key=lambda item: item.onset)
     return result
 
 
@@ -1441,6 +1747,575 @@ def _split_odd_triplet_member(item: VoiceItem) -> list[VoiceItem]:
         VoiceItem(item.onset, 320, first_spec, first_notes),
         VoiceItem(item.onset + 320, 80, second_spec, second_notes),
     ]
+
+
+def _enforce_tuplet_group_integrity(
+    items: list[VoiceItem],
+    measure_length: int,
+    meter: Meter,
+    implicit: bool,
+    grid_step: int | None,
+) -> list[VoiceItem]:
+    """Final guarantee: every emitted bracket is balanced and complete.
+
+    A bracket whose members no longer sum to a complete ratio span — or whose
+    span hides a non-member item — hangs or corrupts importers.  Strip such a
+    group's flags and let the plain re-notation pass re-write the members.
+    """
+
+    out = list(items)
+    changed = False
+    index = 0
+    while index < len(out):
+        if not out[index].tuplet_start:
+            index += 1
+            continue
+        depth = 0
+        stop = index
+        while stop < len(out):
+            current = out[stop]
+            if current.tuplet_start:
+                depth += 1
+            if current.tuplet_stop:
+                depth -= 1
+                if depth == 0:
+                    break
+            stop += 1
+        members = out[index : stop + 1] if stop < len(out) else out[index:]
+        mod = out[index].spec.time_modification
+        total = sum(member.duration for member in members)
+        all_members = all(member.in_tuplet for member in members)
+        valid = (
+            depth == 0
+            and mod is not None
+            and all_members
+            and total in (240, 480, 960)
+            and total % min(member.duration for member in members) == 0
+            and total // min(member.duration for member in members)
+            in {(3, 2): (3, 6, 12), (6, 4): (6, 12), (5, 4): (5, 10)}.get(mod, ())
+        )
+        if not valid:
+            for member in members:
+                member.tuplet_start = False
+                member.tuplet_stop = False
+                member.in_tuplet = False
+            changed = True
+        index = stop + 1
+
+    if changed:
+        out = _rescue_stranded_ratio_runs(out)
+        out = _eliminate_micro_rests(out, measure_length, meter, implicit, grid_step)
+    return out
+
+
+def _snap_free_onsets(
+    items: list[VoiceItem],
+    measure_length: int,
+    meter: Meter,
+    implicit: bool,
+    grid_step: int | None,
+) -> list[VoiceItem]:
+    """Align free-floating note onsets to the finest grid (30 ticks).
+
+    Bucket seams and rescue moves leave some notes a few ticks off any
+    writable position; the gaps around them then need rests no note type can
+    print, and importers reject the resulting underfull measure.  Snapping a
+    free note (an inaudible <=15-tick move) keeps the voice stream exactly
+    recomputable.  Tuplet members — notes *and* their member rests — keep
+    their exact ratio positions, and a note adjacent to a member stays put.
+    """
+
+    def is_member(item: VoiceItem) -> bool:
+        return item.in_tuplet or item.spec.time_modification is not None
+
+    member_spans = [
+        (item.onset, item.onset + item.duration) for item in items if is_member(item)
+    ]
+
+    def collides(onset: int, duration: int) -> bool:
+        return any(onset < end and start < onset + duration for start, end in member_spans)
+
+    result: list[VoiceItem] = []
+    for index, item in enumerate(items):
+        if item.is_rest or is_member(item):
+            result.append(item)
+            continue
+        previous = items[index - 1] if index else None
+        following = items[index + 1] if index + 1 < len(items) else None
+        snapped = round(item.onset / (CANONICAL_DIVISIONS // 16)) * (
+            CANONICAL_DIVISIONS // 16
+        )
+        low = previous.onset + previous.duration if previous is not None else 0
+        high = following.onset if following is not None else measure_length
+        onset = min(max(snapped, low), max(low, high - item.duration))
+        if collides(onset, item.duration):
+            onset = item.onset
+        # Round the duration onto the grid too: with every note boundary on
+        # the 64th grid, the rest fill between them is always recomputable
+        # and no sub-grid crack can survive.  Never round past the next item.
+        duration = max(
+            CANONICAL_DIVISIONS // 16,
+            round(item.duration / (CANONICAL_DIVISIONS // 16)) * (
+                CANONICAL_DIVISIONS // 16
+            ),
+        )
+        duration = min(duration, high - onset, measure_length - onset)
+        # The coerced duration must stay exactly writable: a non-spec value
+        # (or a ratio spec from the local grid) would print a note whose type
+        # disagrees with its duration.  Fall to the largest plain value that
+        # fits; the refill below covers the freed ticks.
+        spec = SPEC_BY_VALUE.get(duration)
+        if spec is None or spec.time_modification is not None:
+            plain = next(
+                (value for value in _PLAIN_SPEC_VALUES if value <= duration),
+                None,
+            )
+            if plain is None or plain < CANONICAL_DIVISIONS // 16:
+                result.append(item)
+                continue
+            duration = plain
+            spec = SPEC_BY_VALUE[duration]
+        if duration != item.duration or onset != item.onset or spec != item.spec:
+            result.append(replace(item, onset=onset, duration=duration, spec=spec))
+        else:
+            result.append(item)
+
+    # Rebuild the rest fill around the final note positions, keeping
+    # tuplet-member rests at their exact spots.  Nothing is ever dropped:
+    # an item displaced by snapping is clamped into the available span, and
+    # one with no room left folds into the previous chord — the voice's total
+    # time and its noteheads both survive.
+    stream: list[VoiceItem] = []
+    cursor = 0
+    remaining = list(result)
+    for position, item in enumerate(remaining):
+        if item.is_rest and not is_member(item):
+            continue
+        next_boundary = measure_length
+        for later in remaining[position + 1 :]:
+            if not later.is_rest or is_member(later):
+                next_boundary = later.onset
+                break
+        onset = max(item.onset, cursor)
+        if onset > cursor:
+            stream.extend(
+                _rest_items(
+                    cursor, onset - cursor, measure_length, meter, implicit, grid_step
+                )
+            )
+        room = next_boundary - onset
+        if room >= item.duration or is_member(item):
+            stream.append(replace(item, onset=onset))
+            cursor = onset + item.duration
+            continue
+        if room >= CANONICAL_DIVISIONS // 16:
+            # The clipped duration must stay exactly writable: an arbitrary
+            # room value (or a ratio spec from the local grid) would print a
+            # note whose type disagrees with its duration.
+            plain = max(
+                (value for value in _PLAIN_SPEC_VALUES if value <= room),
+                default=CANONICAL_DIVISIONS // 16,
+            )
+            stream.append(
+                replace(item, onset=onset, duration=plain, spec=SPEC_BY_VALUE[plain])
+            )
+            cursor = onset + plain
+            continue
+        # Less than a 64th of room: fold the pitches into the open chord, or
+        # steal a 64th from the padding rest so the attack is never dropped.
+        if stream and not stream[-1].is_rest:
+            stream[-1].notes.extend(item.notes)
+            stream[-1].notes.sort(key=lambda note: note.pitch)
+        elif (
+            stream
+            and stream[-1].is_rest
+            and not is_member(stream[-1])
+            and stream[-1].duration > CANONICAL_DIVISIONS // 16
+        ):
+            stream[-1].duration -= CANONICAL_DIVISIONS // 16
+            stream[-1].spec = SPEC_BY_VALUE.get(
+                stream[-1].duration, DurationSpec(stream[-1].duration, "64th")
+            )
+            stolen = stream[-1].onset + stream[-1].duration
+            stream.append(
+                replace(
+                    item,
+                    onset=stolen,
+                    duration=CANONICAL_DIVISIONS // 16,
+                    spec=SPEC_BY_VALUE[CANONICAL_DIVISIONS // 16],
+                )
+            )
+            cursor = stolen + CANONICAL_DIVISIONS // 16
+    if cursor < measure_length:
+        stream.extend(
+            _rest_items(cursor, measure_length - cursor, measure_length, meter, implicit, grid_step)
+        )
+    return _eliminate_micro_rests(stream, measure_length, meter, implicit, grid_step)
+
+
+def _eliminate_micro_rests(
+    stream: list[VoiceItem],
+    measure_length: int,
+    meter: Meter,
+    implicit: bool,
+    grid_step: int | None,
+) -> list[VoiceItem]:
+    """Absorb rests no note type can print into their neighbourhood.
+
+    Importers drop or misread tiny `<forward>` skips, which leaves the measure
+    underfull, so no sub-grid free rest may survive.  A crack merges into the
+    free rest run before it (re-split into clean values), or shifts a
+    following free note earlier, or slides a whole tuplet group as one block
+    (member spacing is preserved), or extends a previous note's clean value.
+    Total voice time never changes.
+    """
+
+    def free_rest(entry: VoiceItem) -> bool:
+        return (
+            entry.is_rest
+            and not entry.in_tuplet
+            and entry.spec.time_modification is None
+        )
+
+    out: list[VoiceItem] = []
+    index = 0
+    while index < len(stream):
+        item = stream[index]
+        if not item.is_rest or item.in_tuplet or item.spec.time_modification is not None or item.duration in SPEC_BY_VALUE:
+            out.append(item)
+            index += 1
+            continue
+
+        crack = item.duration
+        # 1) merge into the free rest run before the crack
+        if out and free_rest(out[-1]):
+            merged = out[-1].duration + crack
+            if _exactly_decomposable(merged):
+                onset = out[-1].onset
+                out[-1:] = _rest_items(onset, merged, measure_length, meter, implicit, grid_step)
+                index += 1
+                continue
+        following = stream[index + 1] if index + 1 < len(stream) else None
+        # 2) shift a following free note earlier to close the crack — but only
+        # when the displaced ticks land in a free rest right after the note.
+        # Moving the note also moves its tail; without a rest there to absorb
+        # the crack, the hole simply re-opens behind the note (and a tail hole
+        # at the measure end silently shortens the voice).
+        if (
+            following is not None
+            and not following.is_rest
+            and not following.in_tuplet
+            and following.spec.time_modification is None
+        ):
+            after = stream[index + 2] if index + 2 < len(stream) else None
+            if after is not None and free_rest(after):
+                grown = after.duration + crack
+                if _exactly_decomposable(grown):
+                    following.onset -= crack
+                    stream[index + 2 : index + 3] = _rest_items(
+                        following.onset + following.duration,
+                        grown,
+                        measure_length,
+                        meter,
+                        implicit,
+                        grid_step,
+                    )
+                    index += 1
+                    continue
+        # 3) slide a following tuplet group earlier as one block
+        if following is not None and (following.in_tuplet or following.spec.time_modification is not None):
+            group_end = index + 1
+            while group_end < len(stream) and (
+                stream[group_end].in_tuplet
+                or stream[group_end].spec.time_modification is not None
+            ):
+                group_end += 1
+            can_slide = True
+            if out:
+                last_end = out[-1].onset + out[-1].duration
+                if following.onset - crack < last_end and not free_rest(out[-1]):
+                    can_slide = False
+            if can_slide:
+                if out and free_rest(out[-1]):
+                    # The rest before the crack donates the space: shrink it
+                    # (or drop it) and slide the group into the freed span.
+                    shrunk = out[-1].duration - crack
+                    if shrunk >= CANONICAL_DIVISIONS // 16:
+                        out[-1].duration = shrunk
+                        out[-1].spec = SPEC_BY_VALUE.get(shrunk, DurationSpec(shrunk, "64th"))
+                    else:
+                        out.pop()
+                    for member_index in range(index + 1, group_end):
+                        stream[member_index].onset -= crack
+                    index += 1
+                    continue
+                # A note precedes the crack: sliding the group earlier leaves
+                # the crack behind the group, so it must land in a free rest
+                # right after the group — otherwise the slide just moves the
+                # hole downstream and shortens the voice.
+                landing = stream[group_end] if group_end < len(stream) else None
+                if (
+                    landing is not None
+                    and free_rest(landing)
+                    and _exactly_decomposable(landing.duration + crack)
+                ):
+                    grown = landing.duration + crack
+                    for member_index in range(index + 1, group_end):
+                        stream[member_index].onset -= crack
+                    group_tail = stream[group_end - 1]
+                    stream[group_end : group_end + 1] = _rest_items(
+                        group_tail.onset + group_tail.duration,
+                        grown,
+                        measure_length,
+                        meter,
+                        implicit,
+                        grid_step,
+                    )
+                    index += 1
+                    continue
+        # 4) extend the previous free note by a clean value.  Only a plain
+        # binary spec may result: extending into a ratio-member value would
+        # re-create the bare time-modified note the rescue passes just
+        # removed, and extending a tuplet member would break its group span.
+        previous_note = next((entry for entry in reversed(out) if not entry.is_rest), None)
+        if previous_note is not None:
+            extended = previous_note.duration + crack
+            spec = SPEC_BY_VALUE.get(extended)
+            if (
+                spec is not None
+                and spec.time_modification is None
+                and not previous_note.in_tuplet
+                and previous_note.spec.time_modification is None
+            ):
+                previous_note.duration = extended
+                previous_note.spec = spec
+                index += 1
+                continue
+        # 5) no landing spot: keep the crack as an untyped skip
+        out.append(item)
+        index += 1
+    return out
+
+
+def _reconcile_voice_stream(
+    items: list[VoiceItem],
+    measure_length: int,
+    meter: Meter,
+    implicit: bool,
+    grid_step: int | None,
+) -> list[VoiceItem]:
+    """Hard guarantee: the voice covers 0..measure_length contiguously and
+    every item is writable.
+
+    The re-notation passes above are careful, but a pathological voice can
+    still slip a hole or a sub-grid fragment through them, and an importer
+    then reports the measure corrupt.  Stray ratio rests first merge into
+    plain rest runs where their total allows it; anything still unwritable
+    re-lays the whole voice on the 64th grid: attacks move by less than a
+    32nd note, no notehead is dropped, and the stream always loads.
+    """
+
+    quantum = CANONICAL_DIVISIONS // 16
+
+    # Rests that lost their tuplet bracket leave the file as time skips, and
+    # skips only account correctly on the 64th grid.  A consecutive run of
+    # them whose total is on the grid re-splits into plain rests instead.
+    normalized: list[VoiceItem] = []
+    index = 0
+    while index < len(items):
+        item = items[index]
+        if item.is_rest and not item.in_tuplet and item.spec.time_modification is not None:
+            run_end = index
+            total = 0
+            while run_end < len(items):
+                current = items[run_end]
+                if not (
+                    current.is_rest
+                    and not current.in_tuplet
+                    and current.spec.time_modification is not None
+                ):
+                    break
+                total += current.duration
+                run_end += 1
+            if total and total % quantum == 0:
+                normalized.extend(_plain_rest_items(item.onset, total))
+            else:
+                normalized.extend(items[index:run_end])
+            index = run_end
+            continue
+        normalized.append(item)
+        index += 1
+    items = normalized
+
+    def writable(item: VoiceItem) -> bool:
+        tm = item.spec.time_modification
+        if item.is_rest:
+            if item.measure_rest:
+                return True
+            if tm is not None:
+                # Member rests print literally inside the bracket; a stray
+                # ratio rest becomes an off-grid time skip.
+                return item.in_tuplet
+            if item.duration in SPEC_BY_VALUE:
+                return item.spec.value == item.duration
+            return item.duration >= quantum and item.duration % quantum == 0
+        # A note must print exactly what it is: the spec's value matches the
+        # duration, and a ratio spec only survives inside a bracketed group.
+        return (
+            item.spec.value == item.duration
+            and (tm is None or item.in_tuplet)
+        )
+
+    cursor = 0
+    clean = True
+    for item in items:
+        if item.onset != cursor or not writable(item):
+            clean = False
+            break
+        cursor += item.duration
+    if clean and cursor == measure_length:
+        return items
+
+    # Last-resort rebuild.  Valid tuplet groups keep their exact spans (their
+    # member spacing is musical information); only the free content around
+    # them is re-laid on the 64th grid.  A trailing hole a group cannot start
+    # after is absorbed by sliding the whole group earlier by its sub-grid
+    # part, so every gap stays on the grid and no note time is lost.
+    segments: list[list[VoiceItem]] = []
+    groups: list[list[VoiceItem]] = []
+    current: list[VoiceItem] = []
+    index = 0
+    while index < len(items):
+        item = items[index]
+        if item.in_tuplet:
+            group: list[VoiceItem] = []
+            while index < len(items) and items[index].in_tuplet:
+                group.append(items[index])
+                index += 1
+            segments.append(current)
+            groups.append(group)
+            current = []
+            continue
+        if not item.is_rest and item.notes:
+            current.append(item)
+        index += 1
+    segments.append(current)
+
+    if not groups and not any(segments):
+        filled = _rest_items(0, measure_length, measure_length, meter, implicit, grid_step)
+        if filled:
+            return filled
+        return [
+            VoiceItem(
+                onset=0,
+                duration=measure_length,
+                spec=DurationSpec(measure_length, "whole"),
+                notes=[],
+                is_rest=True,
+                measure_rest=True,
+            )
+        ]
+
+    def plain_duration(duration: int) -> int:
+        value = max(quantum, round(duration / quantum) * quantum)
+        return next(v for v in _PLAIN_SPEC_VALUES if v <= value)
+
+    out: list[VoiceItem] = []
+    cursor = 0
+    for seg_index, segment in enumerate(segments):
+        group = groups[seg_index] if seg_index < len(groups) else None
+        limit = group[0].onset if group else measure_length
+        for item in segment:
+            duration = plain_duration(item.duration)
+            onset = max(cursor, round(item.onset / quantum) * quantum)
+            if onset + duration > limit:
+                # Prefer an earlier grid slot that keeps the note whole.
+                onset = max(cursor, (limit - duration) // quantum * quantum)
+            if onset + duration > limit:
+                # No grid slot fits the full note: clip to the room left.
+                room = limit - onset
+                if room < quantum:
+                    if (
+                        out
+                        and out[-1].is_rest
+                        and out[-1].duration > quantum
+                    ):
+                        # Steal a 64th of padding so the attack survives; the
+                        # stolen slot always ends at or before the limit.
+                        out[-1].duration -= quantum
+                        out[-1].spec = SPEC_BY_VALUE.get(
+                            out[-1].duration, DurationSpec(out[-1].duration, "64th")
+                        )
+                        stolen = out[-1].onset + out[-1].duration
+                        out.append(
+                            replace(
+                                item,
+                                onset=stolen,
+                                duration=quantum,
+                                spec=SPEC_BY_VALUE[quantum],
+                            )
+                        )
+                    else:
+                        # Fold the pitches into the nearest open chord rather
+                        # than dropping noteheads.
+                        target = next(
+                            (entry for entry in reversed(out) if not entry.is_rest),
+                            None,
+                        )
+                        if target is not None:
+                            target.notes.extend(item.notes)
+                            target.notes.sort(key=lambda note: note.pitch)
+                    continue
+                duration = next(v for v in _PLAIN_SPEC_VALUES if v <= room)
+            if onset > cursor:
+                out.extend(_plain_rest_items(cursor, onset - cursor))
+            out.append(
+                replace(item, onset=onset, duration=duration, spec=SPEC_BY_VALUE[duration])
+            )
+            cursor = onset + duration
+        if group is None:
+            break
+        # The hole between the laid-out content and the group must stay on the
+        # grid; slide the whole group earlier by the hole's sub-grid part.
+        hole = group[0].onset - cursor
+        slide = hole % quantum
+        if slide and group[0].onset - slide >= cursor:
+            group = [replace(member, onset=member.onset - slide) for member in group]
+            hole -= slide
+        if hole > 0:
+            out.extend(_plain_rest_items(cursor, hole))
+            cursor += hole
+        out.extend(group)
+        cursor = group[-1].onset + group[-1].duration
+    if cursor < measure_length:
+        out.extend(_plain_rest_items(cursor, measure_length - cursor))
+    return out
+
+
+def _plain_rest_items(onset: int, duration: int) -> list[VoiceItem]:
+    """Split a gap into plain (ratio-free) rests.
+
+    Every gap handled here is a 64th-grid multiple, which always decomposes
+    into plain values — ratio-member rests would only leave the file again as
+    potentially off-grid skips.
+    """
+
+    pieces: list[VoiceItem] = []
+    remaining = duration
+    while remaining >= CANONICAL_DIVISIONS // 16:
+        value = next(v for v in _PLAIN_SPEC_VALUES if v <= remaining)
+        pieces.append(
+            VoiceItem(
+                onset=onset,
+                duration=value,
+                spec=SPEC_BY_VALUE[value],
+                notes=[],
+                is_rest=True,
+            )
+        )
+        onset += value
+        remaining -= value
+    return pieces
 
 
 def _mark_beams(items: list[VoiceItem], meter: Meter) -> None:

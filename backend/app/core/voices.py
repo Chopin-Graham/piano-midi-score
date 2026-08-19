@@ -263,7 +263,21 @@ def resolve_voice_overlaps(
                 cleaned.pop()
                 dropped += len(previous)
             cleaned.append(event)
-        for event in cleaned:
+        # A free-standing note shorter than a 64th has no printable value:
+        # lengthen it onto the grid when the lane has room, drop it otherwise.
+        final: list[list[QuantizedNote]] = []
+        for index, event in enumerate(cleaned):
+            if all(note.duration < minimum for note in event):
+                next_onset = cleaned[index + 1][0].onset if index + 1 < len(cleaned) else None
+                room = (next_onset if next_onset is not None else event[0].onset + minimum) - event[0].onset
+                if room >= minimum:
+                    event = [replace(note, duration=minimum) for note in event]
+                    clipped += len(event)
+                else:
+                    dropped += len(event)
+                    continue
+            final.append(event)
+        for event in final:
             result.extend(event)
 
     return (

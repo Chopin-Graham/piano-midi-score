@@ -87,7 +87,7 @@ npm run build --prefix frontend
 .\scripts\install_omr.ps1
 ```
 
-随后重新启动服务，即可在同一上传框中选择 `.pdf` 乐谱。OMR 结果未经过量化流水线（它已是记谱文本），复杂谱面建议下载 MusicXML 后在 MuseScore 中校对。
+随后重新启动服务，即可在同一上传框中选择 `.pdf` 乐谱。OMR 识别出的文字与符号（速度记号、力度、装饰音等）会直接保留；若识别结果的小节破损到任何打谱软件都无法加载，系统会自动把破损小节补齐/截齐，仍不行则按识别出的音符经语义流水线重新制谱——保证总能拿到可用的 MusicXML、MIDI 和 A4 PDF。复杂谱面仍建议下载 MusicXML 后在 MuseScore 中校对。
 
 要启用音频/视频转录，先安装 FFmpeg，再建立隔离的模型环境：
 
@@ -127,7 +127,7 @@ npm run build --prefix frontend
 npm audit --prefix frontend --audit-level=moderate
 ```
 
-当前验证基线（2026-08-19）：后端 163 项测试全部通过、总覆盖率 82%；Ruff 通过；前端 5 项测试、TypeScript 类型检查和生产构建通过。50 首 Mutopia 古典钢琴曲全量验收：50/50 转换成功、0 时值规格不匹配、0 连音括号失衡、50/50 通过 MuseScore 回读（起音 F1 中位数 1.000、均值 0.998、最低 0.970）。Animenz《Kawaki wo Ameku》《Unravel》官方 MIDI 制谱回环验收：MuseScore 回读起音 F1 分别为 0.976 / 0.999（0.1 拍容差，旧基线 0.048）。音频/视频全链路：转录 MIDI 经 MuseScore 回读的起音 F1 为 0.9967（0.12 拍容差，含弱起重组偏移校正），成谱合成音频与原录音的 CENS 色度相似度 0.82；29 个真实下载 MIDI 的全量语义门禁与历史基线一致（0 同声部重叠、0 谱表误放新增）。
+当前验证基线（2026-08-20，含 OMR 文字层修复与三级回退后）：后端 163 项测试全部通过、总覆盖率 82%；Ruff 通过；前端 5 项测试、TypeScript 类型检查和生产构建通过。50 首 Mutopia 古典钢琴曲全量验收：50/50 转换成功、0 时值规格不匹配、0 连音括号失衡、50/50 通过 MuseScore 回读（起音 F1 中位数 1.000、均值 0.998、最低 0.965）。Animenz《Kawaki wo Ameku》《Unravel》官方 MIDI 制谱回环验收：MuseScore 回读起音 F1 分别为 0.976 / 0.998（0.1 拍容差，旧基线 0.048）。音频/视频全链路：转录 MIDI 经 MuseScore 回读的起音 F1 为 0.9967（0.12 拍容差，含弱起重组偏移校正），成谱合成音频与原录音的 CENS 色度相似度 0.82；29 个真实下载 MIDI 的全量语义门禁与历史基线一致（0 同声部重叠、0 谱表误放新增）。真实演奏视频转录（含踏板不净、自由速度）完整模式可直接通过 MuseScore 加载制谱。PDF 光学识谱（Audiveris）：50/50 语料成功识别，修复随附 Tesseract 语言包后文字/速度/力度记号可正常识别；破损小节经三级回退（直接雕版 → 小节配平 → 语义重排）全部可出谱，含商业排版的演奏官谱。
 
 复杂回归样例位于 `artifacts/regression-expressive-piano.mid`，最终验收产物位于 `output/pdf/` 和 `artifacts/`。
 

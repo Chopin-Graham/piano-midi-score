@@ -7,7 +7,7 @@ from collections import Counter
 from pathlib import Path
 
 from .clefs import plan_clefs
-from .duration_simplifier import simplify_polyphonic_durations
+from .duration_simplifier import normalize_short_gate_slots, simplify_polyphonic_durations
 from .dynamics import plan_dynamics
 from .hand_splitter import (
     assign_hands,
@@ -198,6 +198,10 @@ def convert_midi_with_score(
     warnings.extend(duration_warnings)
     notes, voice_counts, voice_warnings = assign_voices(notes, options.max_voices_per_staff)
     warnings.extend(voice_warnings)
+
+    short_gate_normalized = 0
+    if options.style != "faithful":
+        notes, short_gate_normalized = normalize_short_gate_slots(notes, measures)
 
     grace_count = 0
     if options.audio_transcription and options.style != "faithful":

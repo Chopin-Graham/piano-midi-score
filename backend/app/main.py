@@ -31,7 +31,10 @@ from .core.roundtrip import musicxml_to_midi_bytes
 from .core.score_omr import (
     ScoreOmrError,
     ScoreOmrUnavailableError,
+    _repair_omr_musicxml,
+    omr_notes_to_midi_bytes,
     omr_status,
+    parse_omr_notes,
     transcribe_score_pdf,
 )
 from .schemas import ConversionResponse, HealthResponse, OptionsResponse
@@ -129,10 +132,8 @@ async def convert(
     except (ValueError, ZeroDivisionError) as exc:
         raise HTTPException(status_code=400, detail=f"转换失败：{exc}") from exc
 
-    engraving = await run_in_threadpool(
-        render_a4_musicxml,
-        musicxml,
-        conversion_options.engraving_style,
+    musicxml, analysis, warnings, engraving = await _engrave_with_safe_fallback(
+        data, filename, musicxml, analysis, warnings, conversion_options
     )
     analysis["engraving"] = engraving.analysis
     warnings.extend(engraving.warnings)
@@ -147,6 +148,62 @@ async def convert(
         analysis=analysis,
         warnings=list(dict.fromkeys(warnings)),
     )
+
+
+def _engraving_failed(engraving) -> bool:
+    """MuseScore is installed but could not load/render the score."""
+
+    return (
+        engraving.pdf_bytes is None
+        and engraving.analysis.get("engine") == "MuseScore Studio 4"
+        and not engraving.analysis.get("available", True)
+    )
+
+
+async def _engrave_with_safe_fallback(
+    data: bytes,
+    filename: str,
+    musicxml: str,
+    analysis: dict,
+    warnings: list[str],
+    conversion_options: ConversionOptions,
+):
+    """Guarantee a renderable result: retry once in safe notation mode.
+
+    Dense or rhythmically free transcriptions can produce notation constructs
+    that MuseScore's importer rejects.  The safe mode converts again with
+    binary-only grids and no triplets — plain but always loadable — so the
+    user still gets a full result instead of a failure.
+    """
+
+    engraving = await run_in_threadpool(
+        render_a4_musicxml,
+        musicxml,
+        conversion_options.engraving_style,
+    )
+    if not _engraving_failed(engraving):
+        return musicxml, analysis, warnings, engraving
+
+    safe_options = conversion_options.model_copy(
+        update={"style": "clean", "allow_triplets": False}
+    )
+    safe_musicxml, safe_analysis, safe_warnings = await run_in_threadpool(
+        convert_midi,
+        data,
+        filename,
+        safe_options,
+    )
+    safe_engraving = await run_in_threadpool(
+        render_a4_musicxml,
+        safe_musicxml,
+        safe_options.engraving_style,
+    )
+    if safe_engraving.pdf_bytes is None:
+        return musicxml, analysis, warnings, engraving
+    safe_warnings.append(
+        "完整记谱触发了 MuseScore 导入兼容性风险，已自动切换为保守记谱模式重试并成功"
+    )
+    return safe_musicxml, safe_analysis, safe_warnings, safe_engraving
 
 
 async def _convert_score_upload(
@@ -204,7 +261,13 @@ async def _convert_score_pdf_upload(
     filename: str,
     conversion_options: ConversionOptions,
 ) -> ConversionResponse:
-    """Recognize a PDF score via OMR, then handle it like a MusicXML upload."""
+    """Recognize a PDF score via OMR, then handle it like a MusicXML upload.
+
+    The OMR export is engraved directly when it loads; when the recognition
+    left broken measures no importer accepts, the notes are extracted
+    tolerantly and re-engraved through the semantic MIDI pipeline — the user
+    always gets a loadable score, never a bare error.
+    """
 
     try:
         omr = await run_in_threadpool(transcribe_score_pdf, data, filename)
@@ -219,6 +282,50 @@ async def _convert_score_pdf_upload(
         f"{stem}.musicxml",
         conversion_options,
     )
+    if response.pdf_base64 is None:
+        # The raw export would not render: try the measure-balanced repair
+        # before falling back to a full semantic rebuild.
+        repaired = _repair_omr_musicxml(omr.musicxml)
+        if repaired != omr.musicxml:
+            response = await _convert_score_upload(
+                repaired.encode("utf-8"),
+                f"{stem}.musicxml",
+                conversion_options,
+            )
+            if response.pdf_base64 is not None:
+                response.warnings.append(
+                    "OMR 输出的破损小节已自动补齐/截齐后完成雕版"
+                )
+    if response.pdf_base64 is None:
+        # The OMR export would not render at all: rebuild from the notes.
+        notes = parse_omr_notes(omr.musicxml)
+        if notes:
+            synthetic_midi = omr_notes_to_midi_bytes(notes)
+            musicxml, analysis, warnings = await run_in_threadpool(
+                convert_midi,
+                synthetic_midi,
+                f"{stem}.mid",
+                conversion_options,
+            )
+            musicxml, analysis, warnings, engraving = await _engrave_with_safe_fallback(
+                synthetic_midi, f"{stem}.mid", musicxml, analysis, warnings, conversion_options
+            )
+            analysis["engraving"] = engraving.analysis
+            warnings.extend(engraving.warnings)
+            warnings.append(
+                "OMR 原始输出存在无法雕版的破损小节，已按识别出的音符经语义流水线重新制谱"
+            )
+            response = ConversionResponse(
+                filename=f"{stem}.musicxml",
+                musicxml=musicxml,
+                midi_filename=f"{stem}.mid",
+                midi_base64=_encode_bytes(synthetic_midi),
+                pdf_filename=f"{stem}-A4.pdf" if engraving.pdf_bytes else None,
+                pdf_base64=_encode_bytes(engraving.pdf_bytes),
+                preview_png_base64=_encode_bytes(engraving.preview_png),
+                analysis=analysis,
+                warnings=warnings,
+            )
     response.warnings = list(dict.fromkeys([*omr.warnings, *response.warnings]))
     response.analysis["omr"] = omr.analysis
     response.analysis["source"] = {
@@ -346,10 +453,13 @@ async def convert_media(
     except (ValueError, ZeroDivisionError) as exc:
         raise HTTPException(status_code=400, detail=f"Conversion failed: {exc}") from exc
 
-    engraving = await run_in_threadpool(
-        render_a4_musicxml,
+    musicxml, analysis, warnings, engraving = await _engrave_with_safe_fallback(
+        transcription.midi_bytes,
+        midi_name,
         musicxml,
-        conversion_options.engraving_style,
+        analysis,
+        warnings,
+        conversion_options,
     )
     analysis["transcription"] = transcription.analysis
     analysis["engraving"] = engraving.analysis

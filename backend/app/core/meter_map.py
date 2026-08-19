@@ -120,6 +120,12 @@ def reframe_audio_pickup(
     if pickup_start <= 0 or pickup_start >= first.duration:
         return measures, notes, 0
 
+    # Keep every snapped onset on its quantization grid: an unaligned shift
+    # would push all later notes a few ticks off their grids and leave
+    # unprintable duration fragments at every measure line.
+    grid = CANONICAL_DIVISIONS // 16
+    pickup_start = max(grid, round(pickup_start / grid) * grid)
+
     pickup = MeasureSpan(
         index=0,
         start=0,
@@ -138,7 +144,7 @@ def reframe_audio_pickup(
                 implicit=measure.implicit,
             )
         )
-    shifted = [replace(note, onset=note.onset - pickup_start) for note in notes]
+    shifted = [replace(note, onset=max(0, note.onset - pickup_start)) for note in notes]
     return reframed, shifted, pickup_start
 
 
