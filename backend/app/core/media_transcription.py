@@ -469,6 +469,11 @@ def _postprocess_midi(
         backend,
         meter_numerator=meter_numerator,
         meter_denominator=meter_denominator,
+        tempo_events=(
+            _performed_tempo_events(beat_times, mapper, tempo_bpm, aligned)
+            if alignment_method == "librosa_dynamic_beat_warp"
+            else None
+        ),
     )
     duration = max(note.end for note in aligned)
     warnings: list[str] = []
@@ -1086,6 +1091,74 @@ def _estimate_note_tempo(notes: list[_TimedNote], source_tempo: float) -> float:
     return max(40.0, min(220.0, 60 / median(normalized)))
 
 
+def _performed_tempo_events(
+    beat_times: list[float],
+    mapper: Callable[[float], float],
+    tempo_bpm: float,
+    notes: list[_TimedNote] | None = None,
+) -> list[tuple[float, float]]:
+    """Recover the performed rit./accel. curve from the tracked beats.
+
+    The written timeline straightens every beat onto a uniform grid, so a
+    genuine ritardando disappears from the score.  Beat trackers also lose
+    lock inside heavy rubato, so the local inter-onset interval is the more
+    reliable witness: where the typical spacing between attacks stretches
+    well past its steady-state value, the player slowed down.  Emits
+    (quarters, bpm) events at region boundaries so the downstream ramp
+    detector sees clean rit./a-tempo structure.
+    """
+
+    del beat_times  # the note IOI below is the more robust witness
+    if not notes or len(notes) < 40:
+        return []
+    onsets = sorted(note.start for note in notes)
+    window = 3.0
+    step = 1.5
+    samples: list[tuple[float, float]] = []
+    t = onsets[0]
+    while t < onsets[-1] - window:
+        segment = [o for o in onsets if t <= o < t + window]
+        iois = [b - a for a, b in zip(segment, segment[1:], strict=False) if 0.03 < b - a < 1.5]
+        if len(iois) >= 3:
+            samples.append((t + window / 2, median(iois)))
+        t += step
+    if len(samples) < 8:
+        return []
+    baseline = median(value for _, value in samples)
+
+    events: list[tuple[float, float]] = []
+    index = 0
+    count = len(samples)
+    while index < count:
+        ratio = samples[index][1] / baseline
+        # Ritemute passages outnumber accelerandos and read cleanly even at a
+        # milder threshold; an "accel" needs a much stronger density surge or
+        # it is just a fast run.
+        if ratio >= 1.35 or ratio <= 0.62:
+            rit_region = ratio >= 1.0
+            stop = index + 1
+            # Extend while the deviation persists (a rit stays slow, an accel
+            # stays fast); stop once the local spacing returns to baseline.
+            while stop < count:
+                stop_ratio = samples[stop][1] / baseline
+                still_deviating = stop_ratio >= 1.25 if rit_region else stop_ratio <= 0.72
+                if not still_deviating:
+                    break
+                stop += 1
+            if stop - index >= 3:
+                region_ratio = median(samples[k][1] for k in range(index, stop)) / baseline
+                region_bpm = tempo_bpm / region_ratio
+                lo_cap = tempo_bpm * 0.25
+                hi_cap = tempo_bpm * (2.5 if rit_region else 1.55)
+                region_bpm = max(lo_cap, min(hi_cap, region_bpm))
+                events.append((mapper(samples[index][0]), region_bpm))
+                events.append((mapper(samples[min(stop, count - 1)][0]), tempo_bpm))
+            index = max(stop, index + 1)
+        else:
+            index += 1
+    return events
+
+
 def _write_aligned_midi(
     notes: list[_TimedNote],
     pedals: list[_TimedPedal],
@@ -1095,15 +1168,14 @@ def _write_aligned_midi(
     *,
     meter_numerator: int = 4,
     meter_denominator: int = 4,
+    tempo_events: list[tuple[float, float]] | None = None,
 ) -> bytes:
     midi = mido.MidiFile(type=1, ticks_per_beat=CANONICAL_DIVISIONS)
     meta_track = mido.MidiTrack()
     note_track = mido.MidiTrack()
     midi.tracks.extend([meta_track, note_track])
     meta_track.append(mido.MetaMessage("track_name", name="Tempo and meter", time=0))
-    meta_track.append(
-        mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(tempo_bpm), time=0)
-    )
+    meta_track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(tempo_bpm), time=0))
     meta_track.append(
         mido.MetaMessage(
             "time_signature",
@@ -1114,6 +1186,21 @@ def _write_aligned_midi(
             time=0,
         )
     )
+    if tempo_events:
+        # Performed rit./accel. curve: the notation pipeline turns sustained
+        # monotone runs into rit./accel. text marks.  Tick 0 keeps the nominal
+        # tempo so the marks always reference the piece's base speed.  The
+        # time signature is already written at tick 0 above, so the deltas
+        # below only ever move forward.
+        previous_tick = 0
+        for quarters, bpm in tempo_events:
+            tick = max(0, round(quarters * CANONICAL_DIVISIONS))
+            if tick <= 0:
+                continue
+            meta_track.append(
+                mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(max(20.0, bpm)), time=tick - previous_tick)
+            )
+            previous_tick = tick
     note_track.append(
         mido.MetaMessage("track_name", name=f"Piano transcription ({backend})", time=0)
     )

@@ -5,7 +5,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from statistics import median
 
-from .models import Hand, PedalEvent, QuantizedNote
+from .models import CANONICAL_DIVISIONS, Hand, PedalEvent, QuantizedNote
 from .options import ConversionOptions
 from .piano_rules import (
     EXTREME_HAND_SPAN_SEMITONES,
@@ -29,6 +29,10 @@ class _Assignment:
     left_center: float | None
     right_center: float | None
     local_cost: float
+    onset: int = 0
+    size: int = 0
+    top_pitch: int = -1
+    top_left: bool = False
 
 
 def assign_hands(
@@ -320,6 +324,10 @@ def _cluster_assignments(cluster: list[QuantizedNote]) -> list[_Assignment]:
                 left_center=median(left_pitches) if left_pitches else None,
                 right_center=median(right_pitches) if right_pitches else None,
                 local_cost=cost,
+                onset=cluster[0].onset if cluster else 0,
+                size=len(cluster),
+                top_pitch=cluster[-1].pitch if cluster else -1,
+                top_left=bool(left) and cluster and cluster[-1] in left,
             )
         )
     return assignments
@@ -336,6 +344,21 @@ def _transition_cost(previous: _Assignment, current: _Assignment) -> float:
             continue
         leap = abs(current_center - previous_center)
         cost += leap * 0.055 + max(0, leap - 12) ** 2 * 0.025
+
+    # A continuing melodic line should not ping-pong between the hands: a
+    # run or cascade that crosses the middle is far better kept in one hand
+    # until a real crossing.  Penalize each flip of the melodic top edge,
+    # harder the faster the line moves.
+    if (
+        previous.top_pitch >= 0
+        and current.top_pitch >= 0
+        and previous.top_left != current.top_left
+    ):
+        gap = current.onset - previous.onset
+        if gap <= CANONICAL_DIVISIONS // 2:  # eighth-note motion or faster
+            cost += 2.6
+        elif gap <= CANONICAL_DIVISIONS:  # quarter-note motion
+            cost += 1.2
     return cost
 
 
