@@ -12,6 +12,7 @@ class HealthResponse(BaseModel):
     version: str
     engraver: dict[str, Any]
     transcriber: dict[str, Any]
+    omr: dict[str, Any]
 
 
 class OptionsResponse(BaseModel):
@@ -19,8 +20,10 @@ class OptionsResponse(BaseModel):
     transcription_defaults: TranscriptionOptions
     max_upload_bytes: int
     max_media_upload_bytes: int
+    max_pdf_upload_bytes: int
     supported_extensions: list[str]
     supported_media_extensions: list[str]
+    supported_score_extensions: list[str]
 
 
 class ConversionResponse(BaseModel):

@@ -44,8 +44,14 @@ def evaluate_notation_quality(
     playability_notes: list[QuantizedNote] | None = None,
     clef_changes: list[ClefChange] | None = None,
     measures: list[MeasureSpan] | None = None,
+    intentional_reductions: int = 0,
 ) -> tuple[dict[str, object], list[str]]:
-    """Run deterministic notation and physical-playability checks."""
+    """Run deterministic notation and physical-playability checks.
+
+    ``intentional_reductions`` counts attacks deliberately merged into
+    trill/tremolo marks or dropped as unprintable sub-grid stubs earlier in
+    the pipeline — musically lossless, so they do not trip the gate.
+    """
 
     warnings: list[str] = []
     overlap_count = _count_voice_overlaps(notes)
@@ -78,11 +84,11 @@ def evaluate_notation_quality(
         )
         for staff in (Staff.RIGHT, Staff.LEFT)
     }
-    preserved = len(notes) == expected_note_count
+    preserved = len(notes) >= expected_note_count - intentional_reductions
 
     if not preserved:
         warnings.append(
-            f"声部整理前后音符数不一致（{expected_note_count} → {len(notes)}），请检查输入"
+            f"声部整理前后音符数不一致（{expected_note_count} → {len(notes)}，含有意合并 {intentional_reductions} 个），请检查输入"
         )
     if overlap_count:
         warnings.append(f"检测到 {overlap_count} 处同声部时间重叠，已阻止静默丢音")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from statistics import fmean, median
 
 import numpy as np
@@ -194,3 +194,80 @@ def _renumber_by_register(events: list[_Event]) -> None:
 
 def _staff_label(staff: Staff) -> str:
     return "右手谱表" if staff == Staff.RIGHT else "左手谱表"
+
+
+def resolve_voice_overlaps(
+    notes: list[QuantizedNote],
+) -> tuple[list[QuantizedNote], int, int]:
+    """Guarantee at most one event stream per (staff, voice).
+
+    Audio transcriptions and grace-note rewrites can leave same-voice notes
+    overlapping: attacks are the reliable half of a transcription, offsets the
+    noisy one.  Same-attack groups collapse to one notated chord (uniform
+    duration); strict overlaps clip the earlier note's tail; stubs shorter
+    than a 64th note cannot be printed and are dropped, counted for warnings.
+    """
+
+    grouped: dict[tuple[object, int], list[QuantizedNote]] = defaultdict(list)
+    passthrough: list[QuantizedNote] = []
+    for note in notes:
+        if note.staff is None or note.grace:
+            passthrough.append(note)
+        else:
+            grouped[(note.staff, note.voice)].append(note)
+
+    clipped = 0
+    dropped = 0
+    result = list(passthrough)
+    minimum = CANONICAL_DIVISIONS // 16
+    for group in grouped.values():
+        ordered = sorted(group, key=lambda note: (note.onset, note.pitch, note.source_id))
+        # Micro-staggered arrivals (transcription noise below a 64th) belong to
+        # the same attack: snap them onto it instead of dropping noteheads.
+        snapped: list[QuantizedNote] = []
+        for note in ordered:
+            if snapped and 0 < note.onset - snapped[-1].onset < minimum:
+                note = replace(note, onset=snapped[-1].onset)
+                clipped += 1
+            snapped.append(note)
+        uniform: list[QuantizedNote] = []
+        index = 0
+        while index < len(snapped):
+            stop = index + 1
+            while stop < len(snapped) and snapped[stop].onset == snapped[index].onset:
+                stop += 1
+            same = list(snapped[index:stop])
+            durations = {note.duration for note in same}
+            if len(durations) > 1:
+                longest = max(durations)
+                same = [replace(note, duration=longest) for note in same]
+                clipped += len(same) - 1
+            uniform.extend(same)
+            index = stop
+
+        events: list[list[QuantizedNote]] = []
+        for note in uniform:
+            if events and note.onset == events[-1][0].onset:
+                events[-1].append(note)
+            else:
+                events.append([note])
+        cleaned: list[list[QuantizedNote]] = []
+        for event in events:
+            while cleaned and event[0].onset < max(n.end for n in cleaned[-1]):
+                previous = cleaned[-1]
+                shortened = event[0].onset - previous[0].onset
+                if shortened >= minimum:
+                    cleaned[-1] = [replace(n, duration=shortened) for n in previous]
+                    clipped += len(previous)
+                    break
+                cleaned.pop()
+                dropped += len(previous)
+            cleaned.append(event)
+        for event in cleaned:
+            result.extend(event)
+
+    return (
+        sorted(result, key=lambda note: (note.onset, note.pitch, note.source_id)),
+        clipped,
+        dropped,
+    )

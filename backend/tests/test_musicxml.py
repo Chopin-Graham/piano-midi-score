@@ -143,7 +143,7 @@ def test_two_full_six_eight_measures_use_only_one_barline_tie() -> None:
     ]
 
 
-def test_secondary_voice_padding_rests_are_hidden() -> None:
+def test_secondary_voice_padding_rests_become_time_skips() -> None:
     notes = [
         QuantizedNote(1, 72, 0, 1920, 80, 0, 0, Staff.RIGHT, 1, hand=Hand.RIGHT),
         QuantizedNote(2, 60, 480, 480, 80, 0, 0, Staff.RIGHT, 2, hand=Hand.LEFT),
@@ -151,15 +151,13 @@ def test_secondary_voice_padding_rests_are_hidden() -> None:
     xml = score_to_musicxml(_score(notes))
     metrics = musicxml_readability_metrics(xml)
 
-    assert metrics["hidden_padding_rests"] >= 2
+    assert metrics["hidden_padding_rests"] == 0
     root = ET.fromstring(xml)
-    assert all(
-        note.get("print-object") == "no"
-        for note in root.findall(".//note[staff='1'][voice='2'][rest]")
-    )
+    skips = root.findall(".//forward[voice='2'][staff='1']")
+    assert [int(skip.findtext("duration")) for skip in skips] == [480, 960]
 
 
-def test_short_sparse_inner_voice_rest_is_hidden_with_partial_coverage() -> None:
+def test_short_sparse_inner_voice_padding_is_skipped_with_partial_coverage() -> None:
     notes = [
         QuantizedNote(1, 76, 0, 720, 80, 0, 0, Staff.RIGHT, 1, hand=Hand.RIGHT),
         QuantizedNote(2, 79, 960, 480, 80, 0, 0, Staff.RIGHT, 1, hand=Hand.RIGHT),
@@ -168,14 +166,16 @@ def test_short_sparse_inner_voice_rest_is_hidden_with_partial_coverage() -> None
     ]
 
     root = ET.fromstring(score_to_musicxml(_score(notes)))
-    internal_rests = [
-        note
-        for note in root.findall(".//note[staff='1'][voice='2'][rest]")
-        if note.findtext("duration") == "480"
-    ]
+    voice_two_rests = root.findall(".//note[staff='1'][voice='2'][rest]")
 
-    assert internal_rests
-    assert all(rest.get("print-object") == "no" for rest in internal_rests)
+    assert all(rest.get("print-object") != "no" for rest in voice_two_rests)
+    skips = root.findall(".//forward[voice='2'][staff='1']")
+    skipped = sum(int(skip.findtext("duration")) for skip in skips)
+    notes_duration = sum(
+        int(note.findtext("duration"))
+        for note in root.findall(".//note[staff='1'][voice='2'][pitch]")
+    )
+    assert skipped + notes_duration == 1920
 
 
 def test_inferred_rolled_chord_writes_musicxml_arpeggiation() -> None:
@@ -882,3 +882,89 @@ def test_musescore_loads_triplet_measures_with_rests(tmp_path: Path) -> None:
         }
     )
     assert exported_pitches == [60, 64]
+
+
+_NOMINAL_TICKS = {
+    "whole": 1920,
+    "half": 960,
+    "quarter": 480,
+    "eighth": 240,
+    "16th": 120,
+    "32nd": 60,
+    "64th": 30,
+}
+
+
+def _assert_all_durations_consistent(root: ET.Element) -> None:
+    for note in root.findall(".//note"):
+        note_type = note.findtext("type")
+        duration_text = note.findtext("duration")
+        if note_type is None or duration_text is None:
+            continue
+        if note.find("rest") is not None and note.find("rest").get("measure") == "yes":
+            continue
+        expected = _NOMINAL_TICKS[note_type]
+        extra = expected
+        for _ in range(len(note.findall("dot"))):
+            extra //= 2
+            expected += extra
+        time_mod = note.find("time-modification")
+        if time_mod is not None:
+            actual = int(time_mod.findtext("actual-notes"))
+            normal = int(time_mod.findtext("normal-notes"))
+            assert expected * normal % actual == 0
+            expected = expected * normal // actual
+        assert int(duration_text) == expected
+
+
+def test_quintuplet_run_brackets_five_members() -> None:
+    notes = [
+        QuantizedNote(index + 1, 60 + index, index * 96, 96, 80, 0, 0, Staff.RIGHT)
+        for index in range(5)
+    ]
+    root = ET.fromstring(score_to_musicxml(_score(notes)))
+
+    modifications = root.findall(".//time-modification")
+    assert modifications
+    assert all(
+        mod.findtext("actual-notes") == "5" and mod.findtext("normal-notes") == "4"
+        for mod in modifications
+    )
+    starts = root.findall(".//notations/tuplet[@type='start']")
+    stops = root.findall(".//notations/tuplet[@type='stop']")
+    assert len(starts) == len(stops) == 1
+    _assert_all_durations_consistent(root)
+
+
+def test_sextuplet_run_brackets_six_members() -> None:
+    notes = [
+        QuantizedNote(index + 1, 60 + index, index * 80, 80, 80, 0, 0, Staff.RIGHT)
+        for index in range(6)
+    ]
+    root = ET.fromstring(score_to_musicxml(_score(notes)))
+
+    first = root.find(".//time-modification")
+    assert first is not None
+    assert first.findtext("actual-notes") == "6"
+    starts = root.findall(".//notations/tuplet[@type='start']")
+    stops = root.findall(".//notations/tuplet[@type='stop']")
+    assert len(starts) == len(stops) == 1
+    _assert_all_durations_consistent(root)
+
+
+def test_incomplete_tuplet_fragment_keeps_consistent_durations() -> None:
+    # An isolated quintuplet member pulls padding rests into its bracket; the
+    # group may only close on a complete ratio span, every bracket must be
+    # balanced, and every note keeps a matching (duration, type, ratio) so
+    # importers never see a corrupt measure.
+    notes = [
+        QuantizedNote(index + 1, 60 + index, index * 96, 96, 80, 0, 0, Staff.RIGHT)
+        for index in range(2)
+    ]
+    notes.append(QuantizedNote(3, 65, 240, 120, 80, 0, 0, Staff.RIGHT))
+    root = ET.fromstring(score_to_musicxml(_score(notes)))
+
+    starts = root.findall(".//notations/tuplet[@type='start']")
+    stops = root.findall(".//notations/tuplet[@type='stop']")
+    assert len(starts) == len(stops)
+    _assert_all_durations_consistent(root)

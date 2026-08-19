@@ -28,15 +28,17 @@ from .models import (
     QuantizedNote,
     ScoreModel,
     Staff,
+    TempoChange,
+    TempoText,
 )
 from .musicxml import musicxml_readability_metrics, score_to_musicxml
 from .options import ConversionOptions
-from .ornaments import collapse_trills, convert_grace_notes
+from .ornaments import collapse_tremolos, collapse_trills, convert_grace_notes
 from .quality import evaluate_notation_quality
 from .quantizer import quantize_midi
 from .spelling import apply_pitch_spelling
 from .staff_assigner import assign_staves, repair_staves_for_planned_clefs
-from .voices import assign_voices
+from .voices import assign_voices, resolve_voice_overlaps
 
 
 def convert_midi(
@@ -158,6 +160,32 @@ def convert_midi_with_score(
                 f"检测到 {trill_count} 处快速二度交替，已按颤音记号书写"
                 f"（合并 {trill_absorbed} 个重复攻击音，总时值不变）"
             )
+    tempo_bpm = parsed.tempos[0].bpm
+    tempo_changes = _tempo_timeline(parsed, measures, scale=scale, timeline_shift=shift)
+    tempo_ramps = _tempo_ramps(tempo_changes)
+    tempo_texts = [TempoText(text_tick, kind) for text_tick, _start, _end, kind in tempo_ramps]
+    tremolo_count = 0
+    tremolo_absorbed = 0
+    if not options.audio_transcription:
+        # A ramp's free region reaches past its last event up to the next tempo
+        # change: the easing tail of an accel./rit. is still cadenza time.
+        event_ticks = [change.tick for change in tempo_changes]
+        free_regions = []
+        for _text_tick, ramp_start, ramp_end, _kind in tempo_ramps:
+            following = [tick for tick in event_ticks if tick > ramp_end]
+            region_end = min(following) if following else ramp_end + 1
+            free_regions.append((ramp_start, region_end))
+        notes, tremolo_count, tremolo_absorbed = collapse_tremolos(
+            notes,
+            free_regions,
+            measures,
+            event_ticks,
+            {decision.measure_index for decision in grid_decisions if decision.step <= 30},
+        )
+        if tremolo_count:
+            warnings.append(
+                f"检测到 {tremolo_count} 处自由速度段落中的快速双音交替，已按震音记号书写（总时值不变）"
+            )
     notes, duration_analysis, duration_warnings = simplify_polyphonic_durations(
         notes,
         max_voices=options.max_voices_per_staff,
@@ -178,6 +206,13 @@ def convert_midi_with_score(
             warnings.append(
                 f"将 {grace_count} 个拍前碎音按倚音记谱（时值已归还相邻音符，未删除任何音头）"
             )
+
+    notes, overlap_clipped, overlap_dropped = resolve_voice_overlaps(notes)
+    if overlap_clipped or overlap_dropped:
+        warnings.append(
+            f"为消除同声部时间重叠，调整了 {overlap_clipped} 个音的书写时值"
+            + (f"，裁掉 {overlap_dropped} 个无法书写的极短音" if overlap_dropped else "")
+        )
 
     key, key_changes, key_warnings = _key_timeline(
         parsed.key_signatures,
@@ -212,14 +247,11 @@ def convert_midi_with_score(
         playability_notes=physical_notes,
         clef_changes=clef_changes,
         measures=measures,
+        intentional_reductions=trill_absorbed + tremolo_absorbed + overlap_dropped,
     )
     warnings.extend(quality_warnings)
     staff_analysis["clefs"] = clef_analysis
     staff_analysis["ledger_pressure_notes"] = quality["ledger_pressure_notes"]
-
-    tempo_bpm = parsed.tempos[0].bpm
-    if len(parsed.tempos) > 1:
-        warnings.append("当前乐谱仅显示初始速度，MIDI 内部速度变化仍保留为后续扩展项")
 
     title = _clean_title(options.title or _title_from_midi(parsed.track_names, filename))
 
@@ -237,6 +269,8 @@ def convert_midi_with_score(
         measures=measures,
         clef_changes=clef_changes,
         key_changes=key_changes,
+        tempo_changes=tempo_changes,
+        tempo_texts=tempo_texts,
         dynamics=dynamics,
         warnings=warnings,
     )
@@ -256,6 +290,10 @@ def convert_midi_with_score(
         "meter": _meter_summary(measures),
         "time_signatures": _time_signature_summary(measures),
         "tempo_bpm": round(tempo_bpm, 2),
+        "tempo_changes": [
+            {"measure": measure_index_at(measures, change.tick) + 1, "bpm": round(change.bpm, 2)}
+            for change in tempo_changes
+        ],
         "key": {
             "tonic_pitch_class": key.tonic_pc,
             "mode": key.mode,
@@ -288,6 +326,8 @@ def convert_midi_with_score(
             "trills": trill_count,
             "trill_absorbed_attacks": trill_absorbed,
             "grace_notes": grace_count,
+            "tremolos": tremolo_count,
+            "tremolo_absorbed_attacks": tremolo_absorbed,
         },
         "spelling": spelling_analysis,
         "notation": notation_analysis,
@@ -323,6 +363,75 @@ def convert_midi_with_score(
         },
     }
     return musicxml, analysis, list(dict.fromkeys(warnings)), score
+
+
+def _tempo_ramps(changes: list[TempoChange]) -> list[tuple[int, int, int, str]]:
+    """Find sustained rit./accel. ramps in the tempo map.
+
+    Returns (text_tick, region_start, region_end, kind) tuples.  A ramp is a
+    monotone run of at least three tempo events spanning two beats or more
+    with a total change of at least 8%.  When the run departs from a long
+    plateau, the text anchor moves to the first event that actually moves —
+    the mark belongs where the motion begins, not at the plateau's edge.
+    """
+
+    ramps: list[tuple[int, int, int, str]] = []
+    index = 0
+    while index < len(changes) - 2:
+        direction = 0
+        stop = index + 1
+        while stop < len(changes):
+            delta = changes[stop].bpm - changes[stop - 1].bpm
+            step = (delta > 0) - (delta < 0)
+            if step == 0 or (direction and step != direction):
+                break
+            direction = step
+            stop += 1
+        run = changes[index:stop]
+        if len(run) >= 3:
+            total = run[-1].bpm - run[0].bpm
+            span = run[-1].tick - run[0].tick
+            if span >= CANONICAL_DIVISIONS * 2 and abs(total) >= run[0].bpm * 0.08:
+                kind = "accel." if total > 0 else "rit."
+                plateau = run[1].tick - run[0].tick >= CANONICAL_DIVISIONS * 8
+                text_tick = run[1].tick if plateau else run[0].tick
+                ramps.append((text_tick, run[0].tick, run[-1].tick, kind))
+        index = max(stop - 1, index + 1)
+    return ramps
+
+
+def _tempo_timeline(
+    parsed,
+    measures: list[MeasureSpan],
+    *,
+    scale: float,
+    timeline_shift: int,
+) -> list[TempoChange]:
+    """Carry the MIDI tempo map onto the canonical score timeline.
+
+    Events are scaled, shifted with the pickup reframe, clamped into the
+    score, and deduplicated: consecutive events at (nearly) the same bpm or
+    the same tick carry no new information.
+    """
+
+    if not parsed.tempos:
+        return []
+    score_end = measures[-1].end
+    changes: list[TempoChange] = []
+    for event in parsed.tempos:
+        tick = max(0, round(event.tick * scale) - timeline_shift)
+        if tick > score_end:
+            continue
+        bpm = event.bpm
+        if changes and changes[-1].tick == tick:
+            changes[-1] = TempoChange(tick, bpm)
+            continue
+        if changes and abs(changes[-1].bpm - bpm) < 0.5:
+            continue
+        changes.append(TempoChange(tick, bpm))
+    if not changes or changes[0].tick != 0:
+        changes.insert(0, TempoChange(0, parsed.tempos[0].bpm))
+    return changes
 
 
 def _key_timeline(

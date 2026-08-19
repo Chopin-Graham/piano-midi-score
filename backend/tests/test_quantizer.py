@@ -143,3 +143,26 @@ def test_audio_auto_keeps_binary_grid_for_noisy_binary_content() -> None:
     _, decisions, _, _ = quantize_midi(_audio_parsed(notes), Meter(4, 4), options)
 
     assert all(not decision.triplet for decision in decisions)
+
+
+def test_per_lane_per_beat_grids_keep_quintuplet_run_exact() -> None:
+    # Track 0 plays a five-per-beat run (96-tick spacing) while track 1 holds
+    # a steady dotted-eighth pattern.  A measure-wide grid would crush one of
+    # them; per-lane, per-beat selection must keep both intact.
+    notes: list[RawNote] = []
+    for index in range(5):
+        onset = index * 96
+        notes.append(RawNote(len(notes), 72 + index, onset, onset + 90, 75, 0, 0))
+    for index, onset in enumerate((0, 360, 720, 960, 1440)):
+        notes.append(RawNote(len(notes), 40 + index, onset, onset + 340, 80, 1, 0))
+
+    quantized, decisions, _, _ = quantize_midi(
+        _audio_parsed(notes), Meter(4, 4), ConversionOptions(style="clean")
+    )
+
+    run = sorted(
+        (note for note in quantized if note.track == 0), key=lambda note: note.onset
+    )
+    assert [note.onset for note in run] == [0, 96, 192, 288, 384]
+    assert all(note.duration == 96 for note in run)
+    assert any(decision.triplet for decision in decisions)

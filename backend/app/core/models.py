@@ -114,6 +114,9 @@ class QuantizedNote:
     arpeggiated: bool = False
     trill: bool = False
     grace: bool = False
+    staccato: bool = False
+    tremolo_start: bool = False
+    tremolo_stop: bool = False
 
     @property
     def end(self) -> int:
@@ -219,6 +222,22 @@ class KeyChange:
 
 
 @dataclass(frozen=True, slots=True)
+class TempoChange:
+    """A tempo event on the canonical score timeline."""
+
+    tick: int
+    bpm: float
+
+
+@dataclass(frozen=True, slots=True)
+class TempoText:
+    """A printable tempo-expression mark (rit./accel.) on the score timeline."""
+
+    tick: int
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class DynamicMark:
     measure_index: int
     mark: str
@@ -248,6 +267,8 @@ class ScoreModel:
     measures: list[MeasureSpan] = field(default_factory=list)
     clef_changes: list[ClefChange] = field(default_factory=list)
     key_changes: list[KeyChange] = field(default_factory=list)
+    tempo_changes: list[TempoChange] = field(default_factory=list)
+    tempo_texts: list[TempoText] = field(default_factory=list)
     dynamics: list[DynamicMark] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 

@@ -56,14 +56,15 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const inputKind = file ? classifyInputFilename(file.name) : null;
   const isMedia = inputKind === "media";
+  const isPdf = inputKind === "pdf";
   const fixedSplit = typeof options.hand_split === "number";
 
   const canConvert = Boolean(file) && !loading;
   const keyLabel = useMemo(() => {
-    if (!result) return "—";
+    if (!result?.analysis.key) return "—";
     return formatKey(result.analysis.key.tonic_pitch_class, result.analysis.key.mode);
   }, [result]);
-  const qualityLabel = result
+  const qualityLabel = result?.analysis.quality
     ? {
         excellent: "优秀",
         playable_but_demanding: "可弹·高难",
@@ -75,11 +76,17 @@ export default function App() {
     if (!nextFile) return;
     const nextKind = classifyInputFilename(nextFile.name);
     if (!nextKind) {
-      setError("请选择 MIDI、MusicXML、常见音频或视频文件");
+      setError("请选择 MIDI、MusicXML、PDF 乐谱或常见音视频文件");
       return;
     }
     if (nextFile.size > uploadLimitBytes(nextKind)) {
-      setError(nextKind === "midi" ? "MIDI 文件不能超过 10 MB" : "音视频文件不能超过 250 MB");
+      setError(
+        nextKind === "media"
+          ? "音视频文件不能超过 250 MB"
+          : nextKind === "pdf"
+            ? "PDF 文件不能超过 50 MB"
+            : "MIDI 文件不能超过 10 MB",
+      );
       return;
     }
     setFile(nextFile);
@@ -170,7 +177,7 @@ export default function App() {
               ) : (
                 <>
                   <strong>拖入文件或点击选择</strong>
-                  <small>MIDI 10 MB · 音视频 250 MB</small>
+                  <small>MIDI 10 MB · PDF 乐谱 50 MB · 音视频 250 MB</small>
                 </>
               )}
             </label>
@@ -178,6 +185,19 @@ export default function App() {
               没有 MIDI？试用内置示例
             </button>
           </section>
+
+          {isPdf && (
+            <section className="transcription-section">
+              <div className="section-heading">
+                <span>02</span>
+                <div><h2>PDF 乐谱识别</h2><p>光学识别（OMR）为 MusicXML 与 MIDI</p></div>
+              </div>
+              <div className="transcription-notice">
+                PDF 由本机 Audiveris 引擎识别；印刷清晰的乐谱效果最佳。识别结果会同时生成 A4
+                排版 PDF 与 MIDI，复杂谱面建议在 MuseScore 中做最后校对。
+              </div>
+            </section>
+          )}
 
           {isMedia && (
             <section className="transcription-section">
@@ -252,7 +272,7 @@ export default function App() {
 
           <section>
             <div className="section-heading">
-              <span>{isMedia ? "03" : "02"}</span>
+              <span>{isMedia || isPdf ? "03" : "02"}</span>
               <div><h2>谱面风格</h2><p>先追求清楚，再追求细节</p></div>
             </div>
             <div className="segmented" role="group" aria-label="谱面风格">
@@ -357,9 +377,9 @@ export default function App() {
           {error && <div className="error-box">{error}</div>}
           <button className="convert-button" disabled={!canConvert} onClick={runConversion}>
             {loading ? (
-              <><span className="spinner" />{isMedia ? "正在转录、分析与排版" : "正在分析与排版"}</>
+              <><span className="spinner" />{isMedia ? "正在转录、分析与排版" : isPdf ? "正在识别乐谱、排版" : "正在分析与排版"}</>
             ) : (
-              isMedia ? "转录并生成钢琴谱" : "生成钢琴谱"
+              isMedia ? "转录并生成钢琴谱" : isPdf ? "识别 PDF 并生成钢琴谱" : "生成钢琴谱"
             )}
           </button>
           <p className="local-note">文件仅交给本机服务处理；转录模型和 FFmpeg 均在本机运行。</p>
@@ -409,7 +429,7 @@ export default function App() {
             <div className="analysis-strip">
               <Metric label="小节" value={result.analysis.measure_count} />
               <Metric label="音符" value={result.analysis.note_count} />
-              <Metric label="拍号" value={result.analysis.meter} />
+              <Metric label="拍号" value={result.analysis.meter ?? "—"} />
               <Metric label="调性" value={keyLabel} />
               <Metric label="质量" value={qualityLabel} />
               <Metric label="版面" value={result.analysis.engraving?.page_size ?? "MusicXML"} />
@@ -436,6 +456,9 @@ export default function App() {
                   label="转录"
                   value={`${result.analysis.transcription.backend} / ${result.analysis.transcription.device}`}
                 />
+              )}
+              {result.analysis.omr && (
+                <Metric label="识别" value={String(result.analysis.omr.engine)} />
               )}
             </div>
           )}

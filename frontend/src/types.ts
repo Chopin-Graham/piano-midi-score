@@ -41,30 +41,31 @@ export interface ConversionResponse {
     title: string;
     note_count: number;
     measure_count: number;
-    duration_quarters: number;
-    meter: string;
-    tempo_bpm: number;
-    key: {
+    duration_quarters?: number;
+    meter?: string;
+    tempo_bpm?: number;
+    tempo_changes?: Array<{ measure: number; bpm: number }>;
+    key?: {
       tonic_pitch_class: number;
       mode: "major" | "minor";
       fifths: number;
       confidence: number;
     };
-    hands: {
+    hands?: {
       right: number;
       left: number;
       method: string;
       split_pitch?: number | string;
     };
-    staves: {
+    staves?: {
       treble: number;
       bass: number;
       method: string;
       cross_staff_hand_notes: number;
       ledger_pressure_notes: number;
     };
-    voices: Record<string, number>;
-    quality: {
+    voices?: Record<string, number>;
+    quality?: {
       status: "excellent" | "playable_but_demanding" | "needs_review";
       note_count_preserved: boolean;
       voice_overlap_count: number;
@@ -82,15 +83,20 @@ export interface ConversionResponse {
       systems?: Array<{ page: number; y: number; measures: number[] }>;
       processing_ms?: number;
     };
-    quantization_grids: Record<string, number>;
+    quantization_grids?: Record<string, number>;
     key_signatures?: Array<{ measure: number; fifths: number }>;
     ornaments?: {
       trills: number;
       grace_notes: number;
       trill_absorbed_attacks?: number;
     };
-    complexity_score: number;
-    processing_ms: number;
+    omr?: {
+      engine: string;
+      processing_ms?: number;
+      [key: string]: unknown;
+    };
+    complexity_score?: number;
+    processing_ms?: number;
     source: Record<string, unknown>;
     transcription?: {
       backend: string;

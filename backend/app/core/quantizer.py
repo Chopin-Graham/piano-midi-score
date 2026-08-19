@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, replace
+from itertools import pairwise
 from statistics import fmean
 
 from .meter_map import measure_index_at
@@ -99,7 +100,17 @@ def quantize_midi(
             measure_notes = notes_by_measure.get(measure_index, [])
             if len(measure_notes) < 3:
                 continue
-            probe_candidates = _grid_candidates(probe, measure.meter)
+            # The vote compares ternary against standard binary grids only.
+            # Ultra-fine grids fit *any* timing almost exactly, so including
+            # them would destroy the calibrated margin that separates genuine
+            # triplets from model timing noise.  Keep the probe on the grid
+            # set the vote was calibrated with.
+            probe_candidates = [
+                grid
+                for grid in _grid_candidates(probe, measure.meter)
+                if grid.name
+                not in {"thirty_second", "thirty_second_triplet", "sixty_fourth"}
+            ]
             binary_error = min(
                 (_grid_timing_error(measure_notes, measure.start, grid.step)
                  for grid in probe_candidates if not grid.triplet),
@@ -141,34 +152,88 @@ def quantize_midi(
             )
             continue
 
-        measure_start = measure.start
-        best = min(
-            candidates,
-            key=lambda grid: _grid_cost(measure_notes, measure_start, grid, options.style),
+        # Choose the grid per (hand lane, beat group).  A measure-wide grid
+        # forces one shared subdivision on every voice, but real piano music
+        # constantly mixes them — e.g. the left hand holds dotted figures
+        # while the right hand plays a quintuplet run.  Per-lane, per-beat
+        # selection lets each hand keep its own true subdivision.
+        buckets: dict[tuple[int, tuple[int, int]], list[QuantizedNote]] = defaultdict(list)
+        for note in measure_notes:
+            beat_index = _beat_group_index(note.onset - measure.start, measure)
+            buckets[(beat_index, (note.track, note.channel))].append(note)
+
+        bucket_grids: dict[tuple[int, tuple[int, int]], GridSpec] = {}
+        for bucket_key, bucket_notes in buckets.items():
+            bucket_start = measure.start + measure.meter.beat_group_boundaries[bucket_key[0]]
+            bucket_candidates = candidates
+            best = min(
+                bucket_candidates,
+                key=lambda grid: _grid_cost(
+                    bucket_notes,
+                    bucket_start,
+                    grid,
+                    options.style,
+                    fidelity_first=len(bucket_notes) <= 3,
+                ),
+            )
+            if best.triplet and _ratio_evidence(bucket_notes, bucket_start, best.step) < 2:
+                # A genuine tuplet figure has at least three members (notes or
+                # internal gaps) on the ratio grid.  With less evidence the
+                # choice would only strand isolated members no bracket can
+                # complete — and no importer can print.
+                binary = [grid for grid in bucket_candidates if not grid.triplet]
+                if binary:
+                    best = min(
+                        binary,
+                        key=lambda grid: _grid_cost(
+                            bucket_notes,
+                            bucket_start,
+                            grid,
+                            options.style,
+                            fidelity_first=len(bucket_notes) <= 3,
+                        ),
+                    )
+            bucket_grids[bucket_key] = best
+
+        finest = min(
+            (bucket_grids[key] for key in bucket_grids),
+            key=lambda grid: grid.step,
+            default=candidates[0],
         )
-        score = _grid_cost(measure_notes, measure_start, best, options.style)
         decisions.append(
             GridDecision(
                 measure_index=measure_index,
-                name=best.name,
-                step=best.step,
-                score=round(score, 4),
-                triplet=best.triplet,
+                name=finest.name,
+                step=finest.step,
+                score=0.0,
+                triplet=any(grid.triplet for grid in bucket_grids.values()),
             )
         )
 
-        for note in measure_notes:
-            relative_onset = note.onset - measure_start
-            snapped_onset = measure_start + _nearest_multiple(relative_onset, best.step)
-            if measure_index == len(measures) - 1 and snapped_onset >= measure.end:
-                snapped_onset = max(measure.start, measure.end - best.step)
-            relative_end = note.end - measure_start
-            snapped_end = measure_start + _nearest_multiple(relative_end, best.step)
-            if snapped_end <= snapped_onset:
-                snapped_end = snapped_onset + best.step
-            quantized.append(
-                replace(note, onset=max(0, snapped_onset), duration=snapped_end - snapped_onset)
-            )
+        for (beat_index, _lane), bucket_notes in buckets.items():
+            grid = bucket_grids[(beat_index, _lane)]
+            bucket_start = measure.start + measure.meter.beat_group_boundaries[beat_index]
+            for note in bucket_notes:
+                snapped_onset = bucket_start + _nearest_multiple(
+                    note.onset - bucket_start, grid.step
+                )
+                if measure_index == len(measures) - 1 and snapped_onset >= measure.end:
+                    snapped_onset = max(measure.start, measure.end - grid.step)
+                snapped_end = bucket_start + _nearest_multiple(
+                    note.end - bucket_start, grid.step
+                )
+                if snapped_end <= snapped_onset:
+                    snapped_end = snapped_onset + grid.step
+                snapped_duration = snapped_end - snapped_onset
+                staccato = _detect_staccato(note, snapped_duration, options)
+                quantized.append(
+                    replace(
+                        note,
+                        onset=max(0, snapped_onset),
+                        duration=snapped_duration,
+                        staccato=staccato,
+                    )
+                )
 
     before_deduplication = len(quantized)
     quantized = _deduplicate_notes(quantized)
@@ -186,18 +251,40 @@ def _grid_candidates(options: ConversionOptions, meter: Meter | None = None) -> 
         GridSpec("eighth", CANONICAL_DIVISIONS // 2, False, 0.00),
         GridSpec("sixteenth", CANONICAL_DIVISIONS // 4, False, 0.05),
         GridSpec("eighth_triplet", CANONICAL_DIVISIONS // 3, True, 0.11),
+        GridSpec("eighth_quintuplet", CANONICAL_DIVISIONS * 2 // 5, True, 0.24),
         GridSpec("sixteenth_triplet", CANONICAL_DIVISIONS // 6, True, 0.20),
+        GridSpec("sixteenth_quintuplet", CANONICAL_DIVISIONS // 5, True, 0.26),
         GridSpec("thirty_second", CANONICAL_DIVISIONS // 8, False, 0.30),
+        GridSpec("thirty_second_quintuplet", CANONICAL_DIVISIONS // 10, True, 0.38),
+        GridSpec("thirty_second_triplet", CANONICAL_DIVISIONS // 12, True, 0.34),
+        GridSpec("sixty_fourth", CANONICAL_DIVISIONS // 16, False, 0.45),
     ]
 
     if options.minimum_note == "eighth":
-        allowed = {"eighth", "eighth_triplet"}
+        allowed = {"eighth", "eighth_triplet", "eighth_quintuplet"}
     elif options.minimum_note == "sixteenth":
-        allowed = {"eighth", "sixteenth", "eighth_triplet", "sixteenth_triplet"}
+        allowed = {
+            "eighth",
+            "sixteenth",
+            "eighth_triplet",
+            "eighth_quintuplet",
+            "sixteenth_triplet",
+            "sixteenth_quintuplet",
+        }
     elif options.minimum_note == "thirty_second":
-        allowed = {spec.name for spec in all_specs}
+        allowed = {spec.name for spec in all_specs if spec.name != "sixty_fourth"}
     elif options.style == "clean":
-        allowed = {"eighth", "sixteenth", "eighth_triplet"}
+        # Clean mode still needs fine grids to be *available*: without them a
+        # genuine fast run (cadenza, glissando-like flourish) collapses onto a
+        # coarse grid and several distinct pitches snap onto one attack, which
+        # the writer then prints as stacked chords.  The style factor keeps
+        # fine grids expensive, so they win only when the false-chord merge
+        # penalty proves the coarse grid is destroying real melody notes.
+        allowed = {
+            spec.name
+            for spec in all_specs
+            if spec.name not in {"thirty_second_triplet", "thirty_second_quintuplet"}
+        }
     else:
         allowed = {spec.name for spec in all_specs}
 
@@ -222,10 +309,12 @@ def _grid_cost(
     measure_start: int,
     grid: GridSpec,
     style: str,
+    fidelity_first: bool = False,
 ) -> float:
     errors: list[float] = []
     collapsed = 0
     tiny_values = 0
+    snapped_onsets: list[tuple[tuple[int, int], int, int, int]] = []
     for note in notes:
         relative_onset = note.onset - measure_start
         snapped_onset = measure_start + _nearest_multiple(relative_onset, grid.step)
@@ -236,12 +325,47 @@ def _grid_cost(
             collapsed += 1
         if snapped_end - snapped_onset <= grid.step:
             tiny_values += 1
+        snapped_onsets.append(((note.track, note.channel), note.pitch, note.onset, snapped_onset))
 
     timing_error = fmean(errors) if errors else 0.0
+    merge_penalty = _false_chord_merges(snapped_onsets) * 1.0 / len(notes)
+    if fidelity_first:
+        # Sparse buckets (a sustained chord, a lone entrance) are readable on
+        # any grid; complexity pricing must not push them onto a coarse grid
+        # that mistimes the attack.  Compare onset fidelity only — releases
+        # get normalized by the grid anyway, and counting them would let an
+        # ultra-fine binary grid outrank a genuinely exact triplet grid.
+        onset_errors = errors[0::2]
+        return (fmean(onset_errors) if onset_errors else 0.0) + merge_penalty
     collapse_penalty = collapsed * 1.25 / len(notes)
     tiny_factor = {"clean": 0.05, "balanced": 0.02, "faithful": 0.0}[style]
     tiny_penalty = tiny_values * tiny_factor / len(notes)
-    return timing_error + grid.complexity + collapse_penalty + tiny_penalty
+    return timing_error + grid.complexity + collapse_penalty + tiny_penalty + merge_penalty
+
+
+def _false_chord_merges(
+    snapped_onsets: list[tuple[tuple[int, int], int, int, int]],
+) -> int:
+    """Count distinct pitches forced onto one attack by the grid.
+
+    Notes played at genuinely different times but snapped to the same grid
+    point surface downstream as a stacked chord, erasing fast runs.  True
+    chord members share the same raw onset, so they merge identically on every
+    grid and never influence the choice.
+    """
+
+    merges = 0
+    by_cell: dict[tuple[tuple[int, int], int], list[tuple[int, int]]] = defaultdict(list)
+    for lane, pitch, raw_onset, snapped_onset in snapped_onsets:
+        by_cell[(lane, snapped_onset)].append((pitch, raw_onset))
+    for members in by_cell.values():
+        if len(members) < 2:
+            continue
+        pitches = {pitch for pitch, _ in members}
+        raw_onsets = {raw_onset for _, raw_onset in members}
+        if len(pitches) > 1 and len(raw_onsets) > 1:
+            merges += sum(1 for _, raw_onset in members if raw_onset != min(raw_onsets))
+    return merges
 
 
 def _grid_timing_error(
@@ -260,6 +384,69 @@ def _grid_timing_error(
 
 def _nearest_multiple(value: int, step: int) -> int:
     return int((value + step / 2) // step) * step
+
+
+def _ratio_evidence(notes: list[QuantizedNote], bucket_start: int, step: int) -> int:
+    """Count distinct attack evidence that only the ratio grid can express.
+
+    A genuine tuplet figure places multiple attacks at positions the binary
+    grid cannot hold (or separates them with non-binary gaps).  A lone
+    sustained chord snapped onto a ratio grid produces at most one such
+    position, so a threshold of two keeps genuine figures and rejects
+    accidents.
+    """
+
+    onsets: set[int] = set()
+    durations: list[int] = []
+    for note in notes:
+        snapped_onset = bucket_start + _nearest_multiple(note.onset - bucket_start, step)
+        snapped_end = bucket_start + _nearest_multiple(note.end - bucket_start, step)
+        if snapped_end <= snapped_onset:
+            snapped_end = snapped_onset + step
+        onsets.add(snapped_onset - bucket_start)
+        durations.append(snapped_end - snapped_onset)
+
+    evidence = sum(1 for onset in onsets if onset % 30)
+    evidence += sum(1 for duration in durations if duration % 30)
+    ordered = sorted(onsets)
+    for first, second in pairwise(ordered):
+        if (second - first) % 30:
+            evidence += 1
+    return evidence
+
+
+def _beat_group_index(relative_onset: int, measure: MeasureSpan) -> int:
+    boundaries = measure.meter.beat_group_boundaries
+    index = 0
+    for group_index, boundary in enumerate(boundaries[1:]):
+        if relative_onset < boundary:
+            index = group_index
+            break
+    else:
+        index = len(boundaries) - 2
+    return max(0, min(index, len(boundaries) - 2))
+
+
+def _detect_staccato(
+    note: QuantizedNote,
+    snapped_duration: int,
+    options: ConversionOptions,
+) -> bool:
+    """Mark notes whose played gate time is far shorter than the written value.
+
+    Notation programs render staccato playback at roughly half the notated
+    length, so a raw gate at or below 60% of the snapped written value is a
+    deliberate staccato rather than a genuinely shorter note value.  Genuine
+    fast-run members (32nd/64th grid values) keep a gate close to the written
+    value and stay untouched, as does audio transcription output, where gate
+    times are model noise rather than articulation evidence.
+    """
+
+    if options.audio_transcription:
+        return False
+    if snapped_duration < CANONICAL_DIVISIONS // 4:
+        return False
+    return note.duration * 5 <= snapped_duration * 3
 
 
 def _collapse_playable_rolled_chords(
@@ -337,7 +524,39 @@ def _deduplicate_notes(notes: list[QuantizedNote]) -> list[QuantizedNote]:
         previous = selected.get(key)
         if previous is None or (note.duration, note.velocity) > (previous.duration, previous.velocity):
             selected[key] = note
-    return sorted(selected.values(), key=lambda note: (note.onset, note.pitch, note.source_id))
+    merged = _merge_subgrid_reattacks(sorted(selected.values(), key=lambda note: (note.onset, note.pitch, note.source_id)))
+    return merged
+
+
+def _merge_subgrid_reattacks(notes: list[QuantizedNote]) -> list[QuantizedNote]:
+    """Merge same-pitch attacks closer together than the finest printable grid.
+
+    Snapped onsets from different beat-group grids can leave the same key
+    "re-struck" 10–20 ticks after its previous attack — a MIDI event artifact
+    no staff can print (the finest grid is a 64th = 30 ticks).  Keeping both
+    would force a sub-grid truncation downstream and an unwritable duration.
+    The stronger of the two attacks survives.
+    """
+
+    by_pitch: dict[int, list[QuantizedNote]] = defaultdict(list)
+    for note in notes:
+        by_pitch[note.pitch].append(note)
+
+    minimum_onset_gap = CANONICAL_DIVISIONS // 16
+    kept: list[QuantizedNote] = []
+    for pitch_notes in by_pitch.values():
+        survivor: QuantizedNote | None = None
+        for note in pitch_notes:  # already onset-sorted
+            if survivor is not None and note.onset - survivor.onset < minimum_onset_gap:
+                if (note.duration, note.velocity) > (survivor.duration, survivor.velocity):
+                    survivor = note
+                continue
+            if survivor is not None:
+                kept.append(survivor)
+            survivor = note
+        if survivor is not None:
+            kept.append(survivor)
+    return sorted(kept, key=lambda note: (note.onset, note.pitch, note.source_id))
 
 
 def _resolve_repeated_pitch_overlaps(notes: list[QuantizedNote]) -> list[QuantizedNote]:

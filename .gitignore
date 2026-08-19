@@ -17,3 +17,8 @@ frontend/dist/
 artifacts/
 tmp/
 output/
+tools/
+
+# 本地测试素材（曲目版权文件与回归语料，不进仓库）
+rawtest/
+midipdfcontainer/

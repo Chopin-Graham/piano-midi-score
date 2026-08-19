@@ -26,18 +26,26 @@
 - MuseScore Studio 4 负责最终的 A4 间距、碰撞规避、分页与 PDF 导出。
 - MuseScore 不可用时仍返回 MusicXML，并由 OpenSheetMusicDisplay 提供网页回退预览。
 - 音频/视频通过 FFmpeg 抽取 44.1 kHz 单声道 PCM；默认用 Transkun 钢琴专用模型，Basic Pitch 作为 Windows 兼容降级路径。
+- PDF 乐谱由 Audiveris 光学识别（OMR）为 MusicXML，再经 MuseScore 导出 MIDI 与 A4 PDF；适合印刷清晰的电子版或扫描谱。
+- MIDI 速度轨完整导出：渐慢/渐快以 `<sound tempo>` 保留回放，稳定速度平台在谱面标注节拍器记号（如 68 → 129）。
+- 快速跑动按真实密度选择 32 分/64 分网格，同一网格点上的不同音高不再被错误压成和弦。
+- 按键时长明显短于书写时值（约 60% 以内）的音自动标注跳音记号，不再写成孤立的短音符。
 - Librosa 节拍跟踪把模型的秒级起止时间动态映射到拍点；重音列分析再决定 3/4 与 4/4 拍号和强拍相位，弱起进入会在制谱层重组为不完全小节；随后只删除亚帧或极弱短伪音，保留快速强起音并规范其释放，再清理重复音和同音重叠。
 - 无调号事件时按滑动窗口做 Krumhansl 调性估计，并用 Viterbi 平滑与短段坍缩只在持续转调处改变调号，避免主属反复造成的调号抖动。
-- 音频模式默认按证据自动启用三连音网格；连续快速二度交替识别为颤音记号；含休止符的三连音组保证括号完整，MuseScore 可直接载入。
-- 网页支持 `.wav/.flac/.mp3/.m4a/.ogg/.opus/.aac` 与 `.mp4/.mov/.mkv/.webm`，并可下载转录后的 MIDI；也可直接上传 `.musicxml/.xml/.mxl` 乐谱文件，导出 A4 PDF 与 MIDI。
+- 音频模式默认按证据自动启用三连音网格；连续快速二度交替识别为颤音记号；自由速度段落中的快速双音交替识别为震音记号；含休止符的三连音组保证括号完整，MuseScore 可直接载入。
+- 支持五连音、六连音等多连音记谱，连音组按比率自然跨度精确闭合；孤立残缺的连音成员会自动改写为可载入的普通时值，杜绝"小节损坏"。
+- 速度坡道自动标注 rit./accel. 文字记号，渐变速度同时以隐藏回放事件保留。
+- 同声部重叠与转录微错位自动归并/截尾：转换永远产出结果，仅以质量提示（warning）告知折衷。
+- 网页支持 `.wav/.flac/.mp3/.m4a/.ogg/.opus/.aac` 与 `.mp4/.mov/.mkv/.webm`，并可下载转录后的 MIDI；也可直接上传 `.musicxml/.xml/.mxl` 乐谱文件导出 A4 PDF 与 MIDI，或上传 `.pdf` 乐谱经 Audiveris 光学识别为 MusicXML 与 MIDI。
 
 ## 环境要求
 
 - Python 3.10 或更高版本；
 - Node.js 20 或更高版本，仅用于构建前端；
-- MuseScore Studio 4，用于 A4 PDF 和精确 PNG 预览。
-- FFmpeg，用于音视频转录时抽取标准 PCM 音频；
-- 可选的独立音频模型环境，推荐 NVIDIA CUDA 显卡运行 Transkun。
+- MuseScore Studio 4，用于 A4 PDF 和精确 PNG 预览：`winget install Musescore.Musescore`
+- FFmpeg，用于音视频转录时抽取标准 PCM 音频：`winget install Gyan.FFmpeg`
+- 可选的 Audiveris（自带 Java 运行时），用于 PDF 乐谱的光学识别 —— 用 `scripts\install_omr.ps1` 自动安装；
+- 可选的独立音频模型环境，推荐 NVIDIA CUDA 显卡运行 Transkun —— 用 `scripts\install_audio_backend.ps1` 自动安装（需要 Python 3.10：`winget install Python.Python.3.10`）。
 
 Windows 默认自动查找：
 
@@ -54,7 +62,8 @@ $env:PIANO_MIDI_SCORE_MUSESCORE = "D:\Apps\MuseScore 4\bin\MuseScore4.exe"
 ## 快速启动
 
 ```powershell
-cd F:\piano-midi-score
+git clone https://github.com/Chopin-Graham/piano-midi-score.git
+cd piano-midi-score
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 npm install --prefix frontend
@@ -63,6 +72,22 @@ npm run build --prefix frontend
 ```
 
 访问 <http://127.0.0.1:8000>，上传 `.mid` 或 `.midi` 文件，或点击“试用内置示例”。页面可以直接下载 A4 PDF 和 MusicXML。
+
+要开放给局域网其他设备访问（手机/平板看谱）：
+
+```powershell
+.\scripts\start.ps1 -Lan
+```
+
+脚本会列出本机的局域网地址，并提示需要管理员执行的防火墙放行命令。
+
+要识别 PDF 乐谱（输出 MusicXML、MIDI 和重新排版的 A4 PDF），先安装 Audiveris：
+
+```powershell
+.\scripts\install_omr.ps1
+```
+
+随后重新启动服务，即可在同一上传框中选择 `.pdf` 乐谱。OMR 结果未经过量化流水线（它已是记谱文本），复杂谱面建议下载 MusicXML 后在 MuseScore 中校对。
 
 要启用音频/视频转录，先安装 FFmpeg，再建立隔离的模型环境：
 
@@ -102,7 +127,7 @@ npm run build --prefix frontend
 npm audit --prefix frontend --audit-level=moderate
 ```
 
-当前验证基线（2026-08-18）：后端 156 项测试全部通过；Ruff 通过；前端 5 项测试、TypeScript 类型检查和生产构建通过。音频/视频全链路新增回环验收：转录 MIDI 经 MuseScore 回读的起音 F1 为 0.9967（0.12 拍容差，含弱起重组偏移校正），成谱合成音频与原录音的 CENS 色度相似度 0.82；29 个真实下载 MIDI 的全量语义门禁与历史基线一致（0 同声部重叠、0 谱表误放新增）。
+当前验证基线（2026-08-19）：后端 163 项测试全部通过、总覆盖率 82%；Ruff 通过；前端 5 项测试、TypeScript 类型检查和生产构建通过。50 首 Mutopia 古典钢琴曲全量验收：50/50 转换成功、0 时值规格不匹配、0 连音括号失衡、50/50 通过 MuseScore 回读（起音 F1 中位数 1.000、均值 0.998、最低 0.970）。Animenz《Kawaki wo Ameku》《Unravel》官方 MIDI 制谱回环验收：MuseScore 回读起音 F1 分别为 0.976 / 0.999（0.1 拍容差，旧基线 0.048）。音频/视频全链路：转录 MIDI 经 MuseScore 回读的起音 F1 为 0.9967（0.12 拍容差，含弱起重组偏移校正），成谱合成音频与原录音的 CENS 色度相似度 0.82；29 个真实下载 MIDI 的全量语义门禁与历史基线一致（0 同声部重叠、0 谱表误放新增）。
 
 复杂回归样例位于 `artifacts/regression-expressive-piano.mid`，最终验收产物位于 `output/pdf/` 和 `artifacts/`。
 

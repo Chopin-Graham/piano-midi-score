@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
+from functools import cache
 from statistics import median
 from xml.etree import ElementTree as ET
 
@@ -45,6 +46,9 @@ class NotationNote:
     arpeggiated: bool = False
     trill: bool = False
     grace: bool = False
+    staccato: bool = False
+    tremolo_start: bool = False
+    tremolo_stop: bool = False
 
 
 @dataclass(slots=True)
@@ -58,6 +62,7 @@ class VoiceItem:
     beam: str | None = None
     tuplet_start: bool = False
     tuplet_stop: bool = False
+    in_tuplet: bool = False
     boundary_rest: bool = False
     hidden_rest: bool = False
     grace_notes: list[NotationNote] = field(default_factory=list)
@@ -69,31 +74,60 @@ DURATION_SPECS = [
     DurationSpec(960, "half"),
     DurationSpec(720, "quarter", 1),
     DurationSpec(480, "quarter"),
+    DurationSpec(384, "quarter", 0, (5, 4)),
     DurationSpec(360, "eighth", 1),
     DurationSpec(320, "quarter", 0, (3, 2)),
+    DurationSpec(288, "eighth", 1, (5, 4)),
     DurationSpec(240, "eighth"),
+    DurationSpec(192, "eighth", 0, (5, 4)),
     DurationSpec(180, "16th", 1),
     DurationSpec(160, "eighth", 0, (3, 2)),
+    DurationSpec(144, "16th", 1, (5, 4)),
     DurationSpec(120, "16th"),
+    DurationSpec(96, "16th", 0, (5, 4)),
     DurationSpec(90, "32nd", 1),
-    DurationSpec(80, "16th", 0, (3, 2)),
+    DurationSpec(80, "16th", 0, (6, 4)),
     DurationSpec(60, "32nd"),
-    DurationSpec(40, "32nd", 0, (3, 2)),
+    DurationSpec(48, "32nd", 0, (5, 4)),
+    DurationSpec(40, "32nd", 0, (6, 4)),
     DurationSpec(30, "64th"),
 ]
 SPEC_BY_VALUE = {spec.value: spec for spec in DURATION_SPECS}
 
-# Inside a complete triplet beat every item must be a triplet member, including
-# rests; a binary eighth between two triplet-eighths breaks MuseScore's tuplet
-# accounting (it then reports the whole measure as corrupt and refuses to
-# load the file).  These specs re-express group members on the triplet grid.
-TRIPLET_SPECS = {
-    80: DurationSpec(80, "16th", 0, (3, 2)),
-    160: DurationSpec(160, "eighth", 0, (3, 2)),
-    240: DurationSpec(240, "eighth", 1, (3, 2)),
-    320: DurationSpec(320, "quarter", 0, (3, 2)),
+# Specs without a time ratio: the only safe choices for decomposing an
+# arbitrary span.  Picking a tuplet spec for an unrelated binary duration
+# prints a ratio where none belongs (a "5:4 quarter" rest for 400 ticks) and
+# leaves unrepresentable remainders behind.
+BINARY_SPECS = [spec for spec in DURATION_SPECS if spec.time_modification is None]
+
+# Tuplet member tables, by (actual, normal) ratio.  Every entry satisfies the
+# MusicXML consistency rule: duration == nominal(type, dots) * normal / actual.
+# A group is bracketed only when its members' real durations sum to exactly
+# span = first_member_duration * actual; groups that cannot be completed keep
+# their exact (duration, type, time-modification) triplets without a bracket,
+# which stays loadable instead of corrupting the measure with a type whose
+# nominal length disagrees with the written duration.
+TUPLET_MEMBER_SPECS: dict[tuple[int, int], dict[int, DurationSpec]] = {
+    (3, 2): {
+        80: DurationSpec(80, "16th", 0, (3, 2)),
+        160: DurationSpec(160, "eighth", 0, (3, 2)),
+        240: DurationSpec(240, "eighth", 1, (3, 2)),
+        320: DurationSpec(320, "quarter", 0, (3, 2)),
+    },
+    (6, 4): {
+        40: DurationSpec(40, "32nd", 0, (6, 4)),
+        80: DurationSpec(80, "16th", 0, (6, 4)),
+        160: DurationSpec(160, "eighth", 0, (6, 4)),
+        240: DurationSpec(240, "eighth", 1, (6, 4)),
+    },
+    (5, 4): {
+        48: DurationSpec(48, "32nd", 0, (5, 4)),
+        96: DurationSpec(96, "16th", 0, (5, 4)),
+        144: DurationSpec(144, "16th", 1, (5, 4)),
+        192: DurationSpec(192, "eighth", 0, (5, 4)),
+        288: DurationSpec(288, "eighth", 1, (5, 4)),
+    },
 }
-TRIPLET_GROUP = CANONICAL_DIVISIONS  # one beat of 3:2 eighth-note triplets
 
 SHARP_PITCHES = {
     0: ("C", 0),
@@ -160,6 +194,13 @@ def score_to_musicxml(score: ScoreModel) -> str:
     keys_by_measure = {
         change.measure_index: change.key for change in score.key_changes
     }
+    tempos_by_measure = _tempos_by_measure(score)
+    tempo_texts_by_measure: dict[int, list[tuple[int, str]]] = defaultdict(list)
+    for tempo_text in score.tempo_texts:
+        text_measure, text_offset = _score_time_location(
+            score, min(tempo_text.tick, score.measures[-1].end)
+        )
+        tempo_texts_by_measure[text_measure].append((text_offset, tempo_text.text))
 
     previous_meter: Meter | None = None
     current_key = score.key
@@ -192,8 +233,10 @@ def score_to_musicxml(score: ScoreModel) -> str:
                 include_key=measure_index == 0 or key_changed,
                 clef_changes=boundary_clef_changes,
             )
-        if measure_index == 0:
-            _add_tempo(measure, score.tempo_bpm)
+        for tempo_offset, tempo_bpm, tempo_visible in tempos_by_measure.get(measure_index, []):
+            _add_tempo(measure, tempo_bpm, offset=tempo_offset, visible=tempo_visible)
+        for text_offset, tempo_text in tempo_texts_by_measure.get(measure_index, []):
+            _add_tempo_text(measure, tempo_text, offset=text_offset)
         previous_meter = measure_span.meter
 
         for offset, down in pedal_by_measure.get(measure_index, []):
@@ -247,7 +290,36 @@ def score_to_musicxml(score: ScoreModel) -> str:
                 ET.SubElement(backup, "duration").text = str(measure_span.duration)
             staff_sequences = [item for item in sequences if item[0] == staff]
             stem_directions = _stem_directions(staff_sequences)
+            pending_skip = 0
             for item in items:
+                # Voice padding covered by other voices is a time skip, not a
+                # printed symbol.  `<forward>` keeps the voice's time accounting
+                # exact without leaving invisible (gray-on-screen) rests in the
+                # editor.  Tuplet-member rests must stay literal: a skip inside
+                # a bracket breaks the tuplet ratio.
+                # Rests whose duration has no exact note-type spec (sub-grid
+                # cracks left where two beat-group grids meet) also become
+                # skips: printing them would require a fake type whose nominal
+                # length disagrees with the written duration, which importers
+                # report as a corrupt measure.
+                if (
+                    item.is_rest
+                    and not item.measure_rest
+                    and item.duration not in SPEC_BY_VALUE
+                ):
+                    pending_skip += item.duration
+                    continue
+                # A ratio-marked rest outside any completed bracket hangs
+                # MuseScore's importer; as pure padding it is a time skip.
+                if item.is_rest and item.spec.time_modification and not item.in_tuplet:
+                    pending_skip += item.duration
+                    continue
+                if item.is_rest and item.hidden_rest and not item.spec.time_modification:
+                    pending_skip += item.duration
+                    continue
+                if pending_skip:
+                    _write_forward(measure, pending_skip, staff, voice)
+                    pending_skip = 0
                 _write_item(
                     measure,
                     item,
@@ -256,6 +328,8 @@ def score_to_musicxml(score: ScoreModel) -> str:
                     current_key.fifths,
                     stem_directions.get(voice),
                 )
+            if pending_skip:
+                _write_forward(measure, pending_skip, staff, voice)
 
         if measure_index == len(score.measures) - 1:
             barline = ET.SubElement(measure, "barline", location="right")
@@ -426,15 +500,67 @@ def _add_attributes(
         ET.SubElement(clef, "line").text = str(change.line)
 
 
-def _add_tempo(measure: ET.Element, bpm: float) -> None:
+def _add_tempo(measure: ET.Element, bpm: float, offset: int = 0, visible: bool = True) -> None:
     rounded = max(20, min(300, round(bpm)))
     direction = ET.SubElement(measure, "direction", placement="above")
-    direction_type = ET.SubElement(direction, "direction-type")
-    metronome = ET.SubElement(direction_type, "metronome", parentheses="no")
-    ET.SubElement(metronome, "beat-unit").text = "quarter"
-    ET.SubElement(metronome, "per-minute").text = str(rounded)
+    if visible:
+        direction_type = ET.SubElement(direction, "direction-type")
+        metronome = ET.SubElement(direction_type, "metronome", parentheses="no")
+        ET.SubElement(metronome, "beat-unit").text = "quarter"
+        ET.SubElement(metronome, "per-minute").text = str(rounded)
+    if offset:
+        ET.SubElement(direction, "offset", sound="yes").text = str(offset)
     ET.SubElement(direction, "sound", tempo=str(rounded))
     ET.SubElement(direction, "staff").text = "1"
+
+
+def _add_tempo_text(measure: ET.Element, text: str, offset: int = 0) -> None:
+    direction = ET.SubElement(measure, "direction", placement="above")
+    direction_type = ET.SubElement(direction, "direction-type")
+    ET.SubElement(direction_type, "words", {"font-style": "italic"}).text = text
+    if offset:
+        ET.SubElement(direction, "offset", sound="yes").text = str(offset)
+    ET.SubElement(direction, "staff").text = "1"
+
+
+def _tempos_by_measure(score: ScoreModel) -> dict[int, list[tuple[int, float, bool]]]:
+    """Place tempo changes on the measure grid and choose printable marks.
+
+    Every MIDI tempo event becomes a `<sound tempo>` direction so playback
+    follows the original tempo map (rit./accel. included).  A visible
+    metronome mark is printed only for sustained plateaus — an event that
+    stays in force for at least a whole note, or a final tempo reached after
+    such a span — so gradual ritardandos do not litter the page with numbers.
+    """
+
+    if not score.tempo_changes:
+        return {0: [(0, score.tempo_bpm, True)]}
+
+    sustained_span = CANONICAL_DIVISIONS * 4
+    changes = score.tempo_changes
+    result: dict[int, list[tuple[int, float, bool]]] = defaultdict(list)
+    last_visible_bpm: float | None = None
+    for index, change in enumerate(changes):
+        measure_index, offset = _score_time_location(
+            score, min(change.tick, score.measures[-1].end)
+        )
+        sustained = (
+            index + 1 < len(changes)
+            and changes[index + 1].tick - change.tick >= sustained_span
+        ) or (
+            index + 1 == len(changes)
+            and index > 0
+            and change.tick - changes[index - 1].tick >= sustained_span
+        )
+        visible = index == 0 or (
+            sustained
+            and last_visible_bpm is not None
+            and abs(change.bpm - last_visible_bpm) / last_visible_bpm >= 0.03
+        )
+        if visible:
+            last_visible_bpm = change.bpm
+        result[measure_index].append((offset, change.bpm, visible))
+    return result
 
 
 def _add_pedal(measure: ET.Element, offset: int, down: bool) -> None:
@@ -578,6 +704,9 @@ def _notation_atoms(
                     arpeggiated=note.arpeggiated,
                     trill=note.trill and index == 0,
                     grace=note.grace,
+                    staccato=note.staccato and index == 0,
+                    tremolo_start=note.tremolo_start and index == 0,
+                    tremolo_stop=note.tremolo_stop and index == 0,
                 )
             )
     return sorted(atoms, key=lambda atom: (atom.onset, atom.staff, atom.voice, atom.pitch))
@@ -619,7 +748,7 @@ def _split_note_across_measures(
             if within_beat:
                 available = min(available, measure.meter.beat_length - within_beat)
 
-        piece = _choose_duration(available)
+        piece = _choose_duration_clean(available)
         pieces.append((current, piece))
         current += piece
         remaining -= piece
@@ -647,7 +776,7 @@ def _split_readable_span(
             if within_beat:
                 available = min(available, meter.beat_length - within_beat)
 
-        piece = _choose_duration(available)
+        piece = _choose_duration_clean(available)
         pieces.append((current, piece))
         current += piece
         remaining -= piece
@@ -657,12 +786,51 @@ def _split_readable_span(
 def _choose_duration(available: int) -> int:
     if available in SPEC_BY_VALUE:
         return available
-    for spec in DURATION_SPECS:
+    for spec in BINARY_SPECS:
         if spec.value <= available:
             return spec.value
     # Quantized input should never reach this branch; retaining the exact value makes
     # the failure visible to format validation instead of silently dropping time.
     return available
+
+
+_SPEC_VALUES_DESC = tuple(sorted(SPEC_BY_VALUE, reverse=True))
+
+
+@cache
+def _exactly_decomposable(duration: int) -> bool:
+    """Whether *duration* splits into one or more exact note-type specs."""
+
+    if duration in SPEC_BY_VALUE:
+        return True
+    if duration < _SPEC_VALUES_DESC[-1]:
+        return False
+    return any(
+        _exactly_decomposable(duration - value)
+        for value in _SPEC_VALUES_DESC
+        if value < duration
+    )
+
+
+def _choose_duration_clean(available: int) -> int:
+    """Largest exact piece, shrunk until the remaining tail also decomposes.
+
+    Greedy largest-first selection can strand a sub-grid tail (100 = 90 + 10,
+    and 10 has no note type).  Shrinking the chosen piece one step (60 + 40)
+    keeps every piece exactly representable.
+    """
+
+    piece = _choose_duration(available)
+    if piece == available or piece not in SPEC_BY_VALUE:
+        return piece
+    tail = available - piece
+    while tail and not _exactly_decomposable(tail):
+        smaller = next((spec.value for spec in BINARY_SPECS if spec.value < piece), None)
+        if smaller is None:
+            break
+        piece = smaller
+        tail = available - piece
+    return piece
 
 
 def _voice_items(
@@ -710,9 +878,30 @@ def _voice_items(
         if onset > cursor:
             items.extend(_rest_items(cursor, onset - cursor, measure_length, meter))
         if onset < cursor:
-            raise ValueError(
-                f"同一声部存在重叠事件：小节起点 {measure_start}，位置 {onset} < {cursor}"
-            )
+            # Never fail the whole conversion on a same-voice overlap: fold a
+            # same-attack arrival into the open chord, clip the previous
+            # item's tail to the largest printable value, or — when the
+            # overlap is shorter than any note type — merge it into the chord.
+            previous = items[-1] if items else None
+            if previous is not None and not previous.is_rest:
+                clipped = onset - previous.onset
+                exact = max(
+                    (value for value in SPEC_BY_VALUE if value <= clipped),
+                    default=0,
+                )
+                if previous.onset != onset and exact:
+                    previous.duration = exact
+                    previous.spec = SPEC_BY_VALUE[exact]
+                    cursor = previous.onset + exact
+                else:
+                    previous.notes.extend(chord_notes)
+                    previous.notes.sort(key=lambda note: note.pitch)
+                    continue
+            else:
+                items.pop() if previous is not None else None
+                cursor = items[-1].onset + items[-1].duration if items else 0
+        if onset < cursor:
+            continue
         spec = SPEC_BY_VALUE.get(duration, DurationSpec(duration, "64th"))
         items.append(
             VoiceItem(
@@ -735,6 +924,7 @@ def _voice_items(
             f"声部时值总和不等于小节长度：{sum(item.duration for item in items)} != {measure_length}"
         )
     items = _complete_tuplet_groups(items, meter)
+    items = _rescue_stranded_ratio_notes(items)
     _mark_beams(items, meter)
     for grace in attachable:
         target = grace.onset + grace.duration - measure_start
@@ -743,6 +933,150 @@ def _voice_items(
                 item.grace_notes.append(grace)
                 break
     return items
+
+
+def _rescue_stranded_ratio_notes(items: list[VoiceItem]) -> list[VoiceItem]:
+    """Re-notate ratio-marked notes that no complete tuplet group claimed.
+
+    A lone 80-tick note (meant as a sextuplet member) cannot be printed as-is:
+    bare ratio members hang MuseScore's importer, and no plain note type has
+    that length.  When an adjacent padding rest can donate exactly enough time
+    to reach a plain, exactly representable value (80 + 40 = a plain 16th),
+    the note keeps its attack and the padding shrinks or disappears — total
+    voice time is preserved and the result imports cleanly.
+    """
+
+    result = list(items)
+    for index, item in enumerate(result):
+        if item.is_rest or not item.spec.time_modification or item.in_tuplet:
+            continue
+        candidates = sorted(
+            (spec.value for spec in BINARY_SPECS if spec.value != item.duration),
+            key=lambda value: (abs(value - item.duration), value),
+        )
+        for target in candidates:
+            delta = target - item.duration
+            if delta > 0 and index + 1 < len(result):
+                following = result[index + 1]
+                if (
+                    following.is_rest
+                    and not following.measure_rest
+                    and not following.in_tuplet
+                    and not following.tuplet_start
+                    and not following.tuplet_stop
+                ):
+                    leftover = following.duration - delta
+                    if leftover == 0 or leftover in SPEC_BY_VALUE:
+                        item.duration = target
+                        item.spec = SPEC_BY_VALUE[target]
+                        if leftover:
+                            result[index + 1] = replace(
+                                following,
+                                onset=following.onset + delta,
+                                duration=leftover,
+                                spec=SPEC_BY_VALUE[leftover],
+                            )
+                        else:
+                            result.pop(index + 1)
+                        break
+            if delta > 0 and index > 0:
+                preceding = result[index - 1]
+                if (
+                    preceding.is_rest
+                    and not preceding.measure_rest
+                    and not preceding.in_tuplet
+                    and not preceding.tuplet_start
+                    and not preceding.tuplet_stop
+                    and preceding.duration <= delta
+                    and item.duration + preceding.duration in SPEC_BY_VALUE
+                ):
+                    item.onset -= preceding.duration
+                    item.duration += preceding.duration
+                    item.spec = SPEC_BY_VALUE[item.duration]
+                    result.pop(index - 1)
+                    break
+        # If no adjacent rest can donate, the note stays as written; the batch
+        # render gate flags any score where that still happens.
+    return _rescue_stranded_ratio_runs(result)
+
+
+def _rescue_stranded_ratio_runs(items: list[VoiceItem]) -> list[VoiceItem]:
+    """Last resort: re-notate a whole stranded run on plain binary values.
+
+    Two triplet eighths at a measure tail (2/3 of a triplet) can never close
+    a bracket, and no neighbor may have free time to donate.  Each note drops
+    to the nearest shorter plain value and the freed ticks collect in one
+    padding rest, keeping the voice's total time and every printed duration
+    exact.
+    """
+
+    result: list[VoiceItem] = []
+    index = 0
+    while index < len(items):
+        item = items[index]
+        if item.is_rest or not item.spec.time_modification or item.in_tuplet:
+            result.append(item)
+            index += 1
+            continue
+        run: list[VoiceItem] = []
+        stop = index
+        while stop < len(items):
+            current = items[stop]
+            if current.in_tuplet or not current.spec.time_modification:
+                break
+            run.append(current)
+            stop += 1
+
+        freed = 0
+        converted: list[VoiceItem] = []
+        for member in run:
+            if member.is_rest:
+                freed += member.duration
+                continue
+            plain = max(
+                (spec.value for spec in BINARY_SPECS if spec.value <= member.duration),
+                default=None,
+            )
+            if plain is None:
+                plain = min(spec.value for spec in BINARY_SPECS)
+            freed += member.duration - plain
+            member.duration = plain
+            member.spec = SPEC_BY_VALUE[plain]
+            member.beam = None
+            converted.append(member)
+        if freed < 0:
+            donor = result[-1] if result else None
+            if (
+                donor is not None
+                and donor.is_rest
+                and not donor.in_tuplet
+                and donor.duration + freed > 0
+            ):
+                donor.duration += freed
+                donor.spec = SPEC_BY_VALUE.get(
+                    donor.duration, DurationSpec(donor.duration, "64th")
+                )
+                freed = 0
+        if freed < 0:
+            # No padding anywhere can cover the extension: keep the run as-is.
+            result.extend(run)
+        else:
+            result.extend(converted)
+            if freed:
+                onset = run[0].onset
+                if converted:
+                    onset = converted[-1].onset + converted[-1].duration
+                result.append(
+                    VoiceItem(
+                        onset=onset,
+                        duration=freed,
+                        spec=SPEC_BY_VALUE.get(freed, DurationSpec(freed, "64th")),
+                        notes=[],
+                        is_rest=True,
+                    )
+                )
+        index = stop
+    return result
 
 
 def _mark_hidden_padding_rests(
@@ -897,53 +1231,197 @@ def _rest_items(
 
 
 def _complete_tuplet_groups(items: list[VoiceItem], meter: Meter) -> list[VoiceItem]:
-    """Re-express triplet content so every tuplet bracket is complete.
+    """Bracket tuplet groups, completing them by absorbing padding rests.
 
-    MuseScore refuses to load a score whose tuplet stop lacks its start — which
-    happened whenever a triplet run began or ended on a rest, because rests
-    never received the notation — or whose triplet group mixes binary and
-    triplet values.  Here triplet-grid runs are re-specified member by member
-    (rests included), values like 400 ticks are split into tied triplet
-    members, and brackets are emitted only for groups that sum to whole
-    triplet beats.  A run that still cannot be completed loses its tuplet
-    markup instead of corrupting the measure: the real durations stay exact,
-    so the file remains loadable and rhythmically truthful.
+    MuseScore's importer hangs on a time-modified item whose measure-mates do
+    not fill a complete ratio span, so no unbracketed ratio member may ever
+    reach the output.  Complete spans are the ratios' natural power-of-two
+    totals (16th triplets close at 240, sextuplets only at 480+, and so on).
+    Short groups pull in adjacent padding rests — split into member units when
+    necessary, before the group as well as after it — until the span closes
+    exactly; absorbed rests keep their hidden/invisible role, so the bracket
+    simply spans padding the voice already owned.
     """
 
     expanded: list[VoiceItem] = []
     for item in items:
         expanded.extend(_split_odd_triplet_member(item))
 
-    # Candidate runs are maximal contiguous chains of triplet-grid items, but
-    # a run must contain at least one genuine time-modification member —
-    # otherwise plain binary eighths in 6/8 would be rebranded as triplets.
+    work = list(expanded)
     result: list[VoiceItem] = []
+    group: list[VoiceItem] = []
+    group_mod: tuple[int, int] | None = None
+    group_sum = 0
+
+    def complete_spans() -> tuple[int, ...]:
+        return (480, 960) if group_mod == (6, 4) else (240, 480, 960)
+
+    def is_complete() -> bool:
+        return bool(group) and group_sum in complete_spans()
+
+    def absorb_backward() -> None:
+        nonlocal group_sum
+        while not is_complete() and result and result[-1].is_rest:
+            tail = result[-1]
+            # Never cannibalize rests that already belong to a closed bracket.
+            if tail.in_tuplet or tail.tuplet_start or tail.tuplet_stop:
+                return
+            target = next((span for span in complete_spans() if span > group_sum), None)
+            if target is None:
+                return
+            needed = target - group_sum
+            if tail.duration in TUPLET_MEMBER_SPECS[group_mod] and tail.duration <= needed:
+                result.pop()
+                group.insert(0, tail)
+                if tail.spec.time_modification != group_mod:
+                    tail.spec = TUPLET_MEMBER_SPECS[group_mod][tail.duration]
+                group_sum += tail.duration
+                continue
+            absorbed = _member_unit_split(min(needed, tail.duration), group_mod)
+            if absorbed is None:
+                return
+            onset = tail.onset
+            pieces = []
+            for part in absorbed:
+                pieces.append(
+                    VoiceItem(
+                        onset=onset,
+                        duration=part,
+                        spec=TUPLET_MEMBER_SPECS[group_mod][part],
+                        notes=[],
+                        is_rest=True,
+                        hidden_rest=tail.hidden_rest,
+                    )
+                )
+                onset += part
+            remainder = tail.duration - sum(absorbed)
+            if remainder:
+                result[-1] = replace(
+                    tail,
+                    duration=remainder,
+                    spec=SPEC_BY_VALUE.get(remainder, DurationSpec(remainder, "64th")),
+                )
+            else:
+                result.pop()
+            group[:0] = pieces
+            group_sum += sum(absorbed)
+
+    def try_alternate_ratios() -> None:
+        """Re-spec a stalled group under a different complete ratio.
+
+        Three sextuplet sixteenths stalling at 240 ticks are, read as 16th
+        triplets, a complete 3:2 group — the written durations are identical,
+        only the ratio label changes.  Trying the aliases rescues groups that
+        absorption could not complete.
+        """
+
+        nonlocal group_mod
+        durations = [member.duration for member in group]
+        for alternative in ((3, 2), (6, 4), (5, 4)):
+            if alternative == group_mod:
+                continue
+            table = TUPLET_MEMBER_SPECS[alternative]
+            if not all(duration in table for duration in durations):
+                continue
+            previous = group_mod
+            group_mod = alternative
+            if is_complete():
+                for member in group:
+                    member.spec = table[member.duration]
+                return
+            group_mod = previous
+
+    def close_group() -> None:
+        nonlocal group, group_mod, group_sum
+        if group and not is_complete():
+            absorb_backward()
+        if group and not is_complete():
+            try_alternate_ratios()
+        if is_complete() and len(group) >= 2:
+            group[0].tuplet_start = True
+            group[-1].tuplet_stop = True
+            for member in group:
+                member.in_tuplet = True
+        result.extend(group)
+        group = []
+        group_mod = None
+        group_sum = 0
+
     index = 0
-    while index < len(expanded):
-        item = expanded[index]
-        eligible = bool(item.spec.time_modification) or item.duration in TRIPLET_SPECS
-        if not eligible:
-            result.append(item)
+    while index < len(work):
+        item = work[index]
+        if group:
+            contiguous = group[-1].onset + group[-1].duration == item.onset
+            if contiguous and not is_complete():
+                target = next((span for span in complete_spans() if span > group_sum), None)
+                needed = (target - group_sum) if target else 0
+                if item.duration in TUPLET_MEMBER_SPECS[group_mod]:
+                    if item.spec.time_modification != group_mod:
+                        item.spec = TUPLET_MEMBER_SPECS[group_mod][item.duration]
+                    group.append(item)
+                    group_sum += item.duration
+                    index += 1
+                    continue
+                if item.is_rest and needed > 0:
+                    absorbed = _member_unit_split(min(needed, item.duration), group_mod)
+                    if absorbed is not None:
+                        onset = item.onset
+                        for part in absorbed:
+                            group.append(
+                                VoiceItem(
+                                    onset=onset,
+                                    duration=part,
+                                    spec=TUPLET_MEMBER_SPECS[group_mod][part],
+                                    notes=[],
+                                    is_rest=True,
+                                    hidden_rest=item.hidden_rest,
+                                )
+                            )
+                            onset += part
+                        remainder = item.duration - sum(absorbed)
+                        if remainder:
+                            work[index] = replace(
+                                item,
+                                onset=item.onset + sum(absorbed),
+                                duration=remainder,
+                                spec=SPEC_BY_VALUE.get(
+                                    remainder, DurationSpec(remainder, "64th")
+                                ),
+                            )
+                        else:
+                            work.pop(index)
+                        group_sum += sum(absorbed)
+                        continue
+            close_group()
+            continue
+
+        mod = item.spec.time_modification
+        if mod is not None and item.duration in TUPLET_MEMBER_SPECS.get(mod, {}):
+            group = [item]
+            group_mod = mod
+            group_sum = item.duration
             index += 1
             continue
-        stop = index + 1
-        while (
-            stop < len(expanded)
-            and (
-                expanded[stop].spec.time_modification
-                or expanded[stop].duration in TRIPLET_SPECS
-            )
-            and expanded[stop - 1].onset + expanded[stop - 1].duration
-            == expanded[stop].onset
-        ):
-            stop += 1
-        run = expanded[index:stop]
-        if any(member.spec.time_modification for member in run):
-            result.extend(_bracket_triplet_run(run))
-        else:
-            result.extend(run)
-        index = stop
+        result.append(item)
+        index += 1
+
+    close_group()
     return result
+
+
+def _member_unit_split(duration: int, mod: tuple[int, int]) -> list[int] | None:
+    """Split *duration* into member units of the given tuplet ratio."""
+
+    members = sorted(TUPLET_MEMBER_SPECS[mod], reverse=True)
+    pieces: list[int] = []
+    remaining = duration
+    for unit in members:
+        while remaining >= unit:
+            pieces.append(unit)
+            remaining -= unit
+    if remaining:
+        return None
+    return pieces
 
 
 def _split_odd_triplet_member(item: VoiceItem) -> list[VoiceItem]:
@@ -955,55 +1433,14 @@ def _split_odd_triplet_member(item: VoiceItem) -> list[VoiceItem]:
         # Already part of a tie chain; leave the exact value untouched rather
         # than disturbing the surrounding notation.
         return [item]
-    first_spec = TRIPLET_SPECS[320]
-    second_spec = TRIPLET_SPECS[80]
+    first_spec = TUPLET_MEMBER_SPECS[(3, 2)][320]
+    second_spec = TUPLET_MEMBER_SPECS[(3, 2)][80]
     first_notes = [replace(note, tie_start=True) for note in item.notes]
     second_notes = [replace(note, tie_stop=True) for note in item.notes]
     return [
         VoiceItem(item.onset, 320, first_spec, first_notes),
         VoiceItem(item.onset + 320, 80, second_spec, second_notes),
     ]
-
-
-def _bracket_triplet_run(run: list[VoiceItem]) -> list[VoiceItem]:
-    for item in run:
-        if not item.spec.time_modification:
-            item.spec = TRIPLET_SPECS[item.duration]
-
-    groups: list[list[VoiceItem]] = []
-    current: list[VoiceItem] = []
-    accumulated = 0
-    for item in run:
-        current.append(item)
-        accumulated += item.duration
-        if accumulated % TRIPLET_GROUP == 0:
-            groups.append(current)
-            current = []
-            accumulated = 0
-    if current:
-        # Incomplete final fragment: cannot form a valid 3:2 tuplet.  Fall back
-        # to plain binary display types with exact durations so the measure
-        # stays loadable instead of emitting an unbalanced bracket.
-        for item in run:
-            item.spec = _binary_fallback_spec(item.duration)
-            item.tuplet_start = False
-            item.tuplet_stop = False
-        return run
-    for group in groups:
-        group[0].tuplet_start = True
-        group[-1].tuplet_stop = True
-    return run
-
-
-def _binary_fallback_spec(duration: int) -> DurationSpec:
-    fallbacks = {
-        80: DurationSpec(80, "32nd"),
-        160: DurationSpec(160, "16th"),
-        240: DurationSpec(240, "eighth"),
-        320: DurationSpec(320, "eighth", 1),
-        400: DurationSpec(400, "eighth", 1),
-    }
-    return fallbacks.get(duration, DurationSpec(duration, "64th"))
 
 
 def _mark_beams(items: list[VoiceItem], meter: Meter) -> None:
@@ -1041,6 +1478,13 @@ def _metric_group_index(onset: int, meter: Meter) -> int:
         if onset < boundary:
             return index
     return len(meter.beat_groups) - 1
+
+
+def _write_forward(measure: ET.Element, duration: int, staff: Staff, voice: int) -> None:
+    forward = ET.SubElement(measure, "forward")
+    ET.SubElement(forward, "duration").text = str(duration)
+    ET.SubElement(forward, "voice").text = str(voice)
+    ET.SubElement(forward, "staff").text = str(int(staff))
 
 
 def _write_item(
@@ -1108,6 +1552,9 @@ def _write_item(
             or item.tuplet_stop
             or notation_note.arpeggiated
             or notation_note.trill
+            or notation_note.staccato
+            or notation_note.tremolo_start
+            or notation_note.tremolo_stop
         ):
             notations = ET.SubElement(note_element, "notations")
             if notation_note.tie_stop:
@@ -1123,6 +1570,13 @@ def _write_item(
             if notation_note.trill:
                 ornaments = ET.SubElement(notations, "ornaments")
                 ET.SubElement(ornaments, "trill-mark")
+            if notation_note.staccato:
+                articulations = ET.SubElement(notations, "articulations")
+                ET.SubElement(articulations, "staccato")
+            if notation_note.tremolo_start or notation_note.tremolo_stop:
+                ornaments = ET.SubElement(notations, "ornaments")
+                tremolo_type = "start" if notation_note.tremolo_start else "stop"
+                ET.SubElement(ornaments, "tremolo", type=tremolo_type).text = "3"
 
 
 def _write_pitch(
@@ -1244,6 +1698,7 @@ def musicxml_readability_metrics(musicxml: str) -> dict[str, object]:
     return {
         "hidden_padding_rests": sum(note.get("print-object") == "no" for note in rests),
         "visible_rests": sum(note.get("print-object") != "no" for note in rests),
+        "voice_time_skips": len(root.findall(".//forward")),
         "measure_rests": sum(
             (rest := note.find("rest")) is not None and rest.get("measure") == "yes"
             for note in rests

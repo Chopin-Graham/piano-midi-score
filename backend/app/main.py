@@ -28,12 +28,20 @@ from .core.midi_parser import MidiParseError
 from .core.options import ConversionOptions, TranscriptionOptions
 from .core.pipeline import convert_midi
 from .core.roundtrip import musicxml_to_midi_bytes
+from .core.score_omr import (
+    ScoreOmrError,
+    ScoreOmrUnavailableError,
+    omr_status,
+    transcribe_score_pdf,
+)
 from .schemas import ConversionResponse, HealthResponse, OptionsResponse
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_MEDIA_UPLOAD_BYTES = 250 * 1024 * 1024
+MAX_PDF_UPLOAD_BYTES = 50 * 1024 * 1024
 SUPPORTED_EXTENSIONS = {".mid", ".midi"}
 SCORE_EXTENSIONS = {".musicxml", ".xml", ".mxl"}
+SCORE_PDF_EXTENSIONS = {".pdf"}
 
 app = FastAPI(
     title="Piano MIDI Score",
@@ -57,6 +65,7 @@ def health() -> HealthResponse:
         version=__version__,
         engraver=engraver_status(),
         transcriber=transcription_status(),
+        omr=omr_status(),
     )
 
 
@@ -67,8 +76,10 @@ def options() -> OptionsResponse:
         transcription_defaults=TranscriptionOptions(),
         max_upload_bytes=MAX_UPLOAD_BYTES,
         max_media_upload_bytes=MAX_MEDIA_UPLOAD_BYTES,
+        max_pdf_upload_bytes=MAX_PDF_UPLOAD_BYTES,
         supported_extensions=sorted(SUPPORTED_EXTENSIONS),
         supported_media_extensions=sorted(MEDIA_EXTENSIONS),
+        supported_score_extensions=sorted(SCORE_EXTENSIONS | SCORE_PDF_EXTENSIONS),
     )
 
 
@@ -79,13 +90,18 @@ async def convert(
 ) -> ConversionResponse:
     filename = Path(file.filename or "score.mid").name
     extension = Path(filename).suffix.lower()
-    if extension not in SUPPORTED_EXTENSIONS | SCORE_EXTENSIONS:
-        raise HTTPException(status_code=415, detail="仅支持 .mid、.midi 或 .musicxml/.xml/.mxl 文件")
+    if extension not in SUPPORTED_EXTENSIONS | SCORE_EXTENSIONS | SCORE_PDF_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail="仅支持 .mid、.midi、.musicxml/.xml/.mxl 或 .pdf 文件",
+        )
 
-    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    size_limit = MAX_PDF_UPLOAD_BYTES if extension in SCORE_PDF_EXTENSIONS else MAX_UPLOAD_BYTES
+    data = await file.read(size_limit + 1)
     await file.close()
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="文件不能超过 10 MB")
+    if len(data) > size_limit:
+        limit_mb = size_limit // (1024 * 1024)
+        raise HTTPException(status_code=413, detail=f"文件不能超过 {limit_mb} MB")
 
     try:
         raw_options = json.loads(options_json)
@@ -94,6 +110,9 @@ async def convert(
         raise HTTPException(status_code=422, detail="options_json 不是有效 JSON") from exc
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
+
+    if extension in SCORE_PDF_EXTENSIONS:
+        return await _convert_score_pdf_upload(data, filename, conversion_options)
 
     if extension in SCORE_EXTENSIONS:
         return await _convert_score_upload(data, filename, conversion_options)
@@ -178,6 +197,35 @@ async def _convert_score_upload(
         analysis=_score_upload_analysis(musicxml, filename, engraving.analysis),
         warnings=list(dict.fromkeys(warnings)),
     )
+
+
+async def _convert_score_pdf_upload(
+    data: bytes,
+    filename: str,
+    conversion_options: ConversionOptions,
+) -> ConversionResponse:
+    """Recognize a PDF score via OMR, then handle it like a MusicXML upload."""
+
+    try:
+        omr = await run_in_threadpool(transcribe_score_pdf, data, filename)
+    except ScoreOmrUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ScoreOmrError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    stem = Path(filename).stem or "score"
+    response = await _convert_score_upload(
+        omr.musicxml.encode("utf-8"),
+        f"{stem}.musicxml",
+        conversion_options,
+    )
+    response.warnings = list(dict.fromkeys([*omr.warnings, *response.warnings]))
+    response.analysis["omr"] = omr.analysis
+    response.analysis["source"] = {
+        **response.analysis.get("source", {}),
+        "format": "pdf",
+    }
+    return response
 
 
 def _decode_score_upload(data: bytes, filename: str) -> str:

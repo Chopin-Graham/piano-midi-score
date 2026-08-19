@@ -129,3 +129,51 @@ def test_convert_endpoint_rejects_invalid_musicxml() -> None:
     )
 
     assert response.status_code == 400
+
+
+def test_convert_endpoint_accepts_pdf_upload(monkeypatch) -> None:
+    from app.core.pipeline import convert_midi
+    from app.core.score_omr import ScoreOmrResult
+
+    musicxml, _, _ = convert_midi(piano_midi_bytes(), "piece.mid")
+    monkeypatch.setattr(
+        main_module,
+        "transcribe_score_pdf",
+        lambda *_args, **_kwargs: ScoreOmrResult(
+            musicxml=musicxml,
+            analysis={"engine": "Audiveris"},
+        ),
+    )
+
+    response = request(
+        "POST",
+        "/api/convert",
+        files={"file": ("piece.pdf", b"%PDF-1.7 fake", "application/pdf")},
+        data={"options_json": "{}"},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["filename"] == "piece.musicxml"
+    assert payload["analysis"]["source"]["format"] == "pdf"
+    assert payload["analysis"]["omr"]["engine"] == "Audiveris"
+    if payload["midi_base64"]:
+        assert base64.b64decode(payload["midi_base64"]).startswith(b"MThd")
+
+
+def test_convert_endpoint_pdf_without_omr_engine(monkeypatch) -> None:
+    from app.core.score_omr import ScoreOmrUnavailableError
+
+    def _unavailable(*_args, **_kwargs):
+        raise ScoreOmrUnavailableError("未找到 Audiveris OMR 引擎")
+
+    monkeypatch.setattr(main_module, "transcribe_score_pdf", _unavailable)
+
+    response = request(
+        "POST",
+        "/api/convert",
+        files={"file": ("piece.pdf", b"%PDF-1.7 fake", "application/pdf")},
+        data={"options_json": "{}"},
+    )
+
+    assert response.status_code == 503
