@@ -397,3 +397,35 @@ def test_audio_transcription_release_cell_follows_triplet_grid() -> None:
     # Without grid information the release cell stays binary and manufactures a
     # 240-tick value that does not exist on the triplet grid.
     assert next(note for note in binary if note.source_id == 1).duration == 240
+
+
+def test_absorb_articulation_gaps_swallows_short_silences() -> None:
+    from app.core.duration_simplifier import absorb_articulation_gaps
+
+    notes = [
+        QuantizedNote(1, 60, 0, 180, 80, 0, 0, Staff.RIGHT),
+        QuantizedNote(2, 62, 240, 120, 80, 0, 0, Staff.RIGHT),
+        QuantizedNote(3, 64, 480, 240, 80, 0, 0, Staff.RIGHT),
+    ]
+
+    absorbed, count = absorb_articulation_gaps(notes)
+
+    assert count == 2
+    by_onset = {note.onset: note.duration for note in absorbed}
+    assert by_onset[0] == 240   # 180 + the 60-tick gap now reaches the next attack
+    assert by_onset[240] == 240  # 120 + the 120-tick gap
+    assert by_onset[480] == 240  # last note untouched
+
+
+def test_absorb_articulation_gaps_leaves_long_gaps_alone() -> None:
+    from app.core.duration_simplifier import absorb_articulation_gaps
+
+    notes = [
+        QuantizedNote(1, 60, 0, 240, 80, 0, 0, Staff.RIGHT),
+        QuantizedNote(2, 62, 960, 240, 80, 0, 0, Staff.RIGHT),
+    ]
+
+    absorbed, count = absorb_articulation_gaps(notes)
+
+    assert count == 0
+    assert absorbed[0].duration == 240

@@ -84,6 +84,20 @@ def test_collapse_trills_ignores_wide_intervals() -> None:
     assert len(collapsed) == len(notes)
 
 
+def test_collapse_trills_ignores_measured_eighth_alternation() -> None:
+    # An eighth-speed two-pitch oscillation is a measured figure, not a
+    # trill; only sixteenth-speed (or faster) alternation earns the mark.
+    notes = [
+        QuantizedNote(index + 1, 72 + (index % 2), index * 240, 240, 80, 0, 0, Staff.RIGHT)
+        for index in range(10)
+    ]
+
+    collapsed, trills, _ = collapse_trills(notes)
+
+    assert trills == 0
+    assert len(collapsed) == len(notes)
+
+
 def test_trill_note_writes_ornament_and_keeps_voice_time() -> None:
     meter = Meter(4, 4)
     measure = MeasureSpan(0, 0, meter.measure_length, meter)

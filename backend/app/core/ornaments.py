@@ -16,7 +16,10 @@ from .models import CANONICAL_DIVISIONS, QuantizedNote, Staff
 
 MIN_TRILL_ATTACKS = 6
 MIN_TRILL_SPAN = (CANONICAL_DIVISIONS * 3) // 4  # about a dotted quarter of alternation
-MAX_TRILL_MEMBER = CANONICAL_DIVISIONS // 2  # members are eighth-note or faster
+# A performed trill alternates at sixteenth-note speed or faster; an
+# eighth-speed two-pitch figure is a measured ornament, not a trill, and
+# writing "tr" over it puts a mark no editor expects.
+MAX_TRILL_MEMBER = CANONICAL_DIVISIONS // 4  # members are sixteenth-note or faster
 
 MIN_TREMOLO_ATTACKS = 8
 MAX_TREMOLO_SPACING = CANONICAL_DIVISIONS // 8  # 32nd-note speed or faster

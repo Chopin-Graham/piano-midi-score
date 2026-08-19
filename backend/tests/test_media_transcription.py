@@ -220,6 +220,29 @@ def test_estimate_meter_shifts_barlines_onto_downbeats() -> None:
     assert phase == 1.0
 
 
+def test_estimate_meter_pulls_sixteenth_grid_slip_back() -> None:
+    # A beat tracker that locked a sixteenth early leaves every onset a
+    # quarter-of-a-beat off the true grid; integer-beat phase hypotheses can
+    # never catch that, so the search must reach sixteenth resolution.
+    seconds_per_beat = 0.5
+    notes: list[_TimedNote] = []
+    slip = 0.25 * seconds_per_beat
+    for measure in range(12):
+        base = measure * 4 * seconds_per_beat + slip
+        notes.append(_TimedNote(36, base, base + 1.6 * seconds_per_beat, 96))
+        for beat in range(1, 4):
+            onset = base + beat * seconds_per_beat
+            for pitch in (60, 64, 67):
+                notes.append(_TimedNote(pitch, onset, onset + 0.4 * seconds_per_beat, 68))
+
+    numerator, denominator, phase = _estimate_meter_and_downbeat(
+        notes, lambda seconds: seconds * 2.0
+    )
+
+    assert (numerator, denominator) == (4, 4)
+    assert abs(phase - 0.25) < 0.03
+
+
 def test_estimate_meter_detects_compound_six_eight() -> None:
     # Two dotted-quarter beats per bar, each split into three eighths.
     seconds_per_beat = 0.5

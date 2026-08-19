@@ -965,11 +965,16 @@ def _estimate_meter_and_downbeat(
         return 4, 4, 0.0
 
     total_weight = 0.0
-    scores: dict[tuple[int, int], float] = {}
+    scores: dict[tuple[int, float], float] = {}
+    # Beat trackers can lock onto a sixteenth off-beat: every onset then sits
+    # a sub-beat fraction off the true quarter grid, and integer-beat phase
+    # hypotheses can never pull it back.  Search downbeats at sixteenth
+    # resolution so a one-sixteenth grid slip still finds the real barline.
+    phase_steps = [index / 4 for index in range(16)]
     hypotheses = (
-        [(4, phase) for phase in range(4)]
-        + [(3, phase) for phase in range(3)]
-        + [(2, phase) for phase in range(2)]
+        [(4, phase) for phase in phase_steps]
+        + [(3, phase) for phase in phase_steps[:12]]
+        + [(2, phase) for phase in phase_steps[:8]]
     )
     for hypothesis in hypotheses:
         scores[hypothesis] = 0.0
@@ -994,9 +999,9 @@ def _estimate_meter_and_downbeat(
     reference = max(total_weight, 1.0)
     margin = 0.06 * reference
 
-    def family_winner(meter: int) -> tuple[int, int]:
+    def family_winner(meter: int) -> tuple[int, float]:
         return max(
-            ((meter, phase) for phase in range(meter)),
+            ((m, phase) for m, phase in scores if m == meter),
             key=lambda hypothesis: scores[hypothesis],
         )
 

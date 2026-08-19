@@ -7,7 +7,11 @@ from collections import Counter
 from pathlib import Path
 
 from .clefs import plan_clefs
-from .duration_simplifier import normalize_short_gate_slots, simplify_polyphonic_durations
+from .duration_simplifier import (
+    absorb_articulation_gaps,
+    normalize_short_gate_slots,
+    simplify_polyphonic_durations,
+)
 from .dynamics import plan_dynamics
 from .hand_splitter import (
     assign_hands,
@@ -202,6 +206,12 @@ def convert_midi_with_score(
     short_gate_normalized = 0
     if options.style != "faithful":
         notes, short_gate_normalized = normalize_short_gate_slots(notes, measures)
+        if options.audio_transcription:
+            notes, gaps_absorbed = absorb_articulation_gaps(notes)
+            if gaps_absorbed:
+                warnings.append(
+                    f"已将 {gaps_absorbed} 处演奏缝隙并入前音时值（不再产生短休止符）"
+                )
 
     grace_count = 0
     if options.audio_transcription and options.style != "faithful":

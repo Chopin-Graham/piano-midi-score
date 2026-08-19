@@ -595,17 +595,15 @@ def normalize_short_gate_slots(
     notes: list[QuantizedNote],
     measures: list[MeasureSpan],
 ) -> tuple[list[QuantizedNote], int]:
-    """Normalize short-gate articulation to readable slot values + staccato.
+    """Normalize short-gate articulation to a full slot value + staccato dot.
 
-    Some MIDI sources encode articulation as short gate times: a staccato
-    sixteenth arrives as a 32nd-long keypress (about half the slot).  Printed
-    literally, that is a 32nd note trailing 16th/32nd rests — visual noise
-    that misreads the articulation.  When a note sounds for at most ~55% of
-    the time until the next attack in its voice, engravers write a plain
-    slot value with a staccato dot instead: the written duration doubles to
-    the clean binary value at most half the slot, the dot says "play short".
-    Notes inside runs (no gap after them) and ratio-grid (tuplet) members
-    stay untouched.
+    Some MIDI sources encode articulation as short gate times: a detached
+    sixteenth arrives as a 32nd-long keypress.  Printed literally — or worse,
+    split into a half-slot note plus a half-slot rest — the page drowns in
+    16th/32nd rests no player ever reads.  Engravers write the full slot
+    value with a staccato dot instead: the dot says "play short", and no
+    rest appears at all.  Notes inside runs (no gap after them) and
+    ratio-grid (tuplet) members stay untouched.
     """
 
     lane_attacks: dict[tuple[object, int], list[int]] = defaultdict(list)
@@ -636,8 +634,9 @@ def normalize_short_gate_slots(
         if note.duration * 20 > slot * 11:  # gate longer than ~55% of the slot
             result.append(note)
             continue
-        target = slot // 2
-        clean = [v for v in _CLEAN_BINARY if v <= target]
+        # Fill the whole inter-attack slot: a staccato dot carries the short
+        # articulation, so no padding rest is ever printed.
+        clean = [v for v in _CLEAN_BINARY if v <= slot]
         if not clean:
             result.append(note)
             continue
@@ -655,3 +654,45 @@ def normalize_short_gate_slots(
 
 
 _CLEAN_BINARY = (480, 360, 240, 180, 120, 90, 60, 30)
+
+
+def absorb_articulation_gaps(
+    notes: list[QuantizedNote],
+    *,
+    max_gap: int = 120,
+) -> tuple[list[QuantizedNote], int]:
+    """Swallow articulation gaps into the preceding note.
+
+    A played attack never lands exactly on its written release: transcriptions
+    are full of 30–120-tick silences that are just key noise, and printing
+    each as a 16th/32nd rest makes the page unreadable.  Extending the
+    previous note to the next attack turns the gap into ordinary legato
+    spacing; the downstream grid snap re-notates the total cleanly.
+    """
+
+    lanes: dict[tuple[object, int], list[QuantizedNote]] = defaultdict(list)
+    for note in notes:
+        if note.staff is not None:
+            lanes[(note.staff, note.voice)].append(note)
+
+    absorbed = 0
+    swallow: dict[int, int] = {}
+    for lane_notes in lanes.values():
+        lane_notes.sort(key=lambda note: (note.onset, note.pitch))
+        for current, following in zip(lane_notes, lane_notes[1:], strict=False):
+            if current.grace or current.trill or current.tremolo_start or current.tremolo_stop:
+                continue
+            gap = following.onset - (current.onset + current.duration)
+            if 0 < gap <= max_gap:
+                swallow[id(current)] = following.onset - current.onset
+                absorbed += 1
+
+    if not absorbed:
+        return notes, 0
+    return (
+        [
+            replace(note, duration=swallow[id(note)]) if id(note) in swallow else note
+            for note in notes
+        ],
+        absorbed,
+    )
