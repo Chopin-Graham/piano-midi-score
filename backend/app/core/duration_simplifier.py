@@ -3,6 +3,7 @@ from __future__ import annotations
 from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import replace
+from statistics import median
 
 from .meter_map import measure_index_at
 from .models import (
@@ -591,19 +592,181 @@ def _active_importance(notes: list[QuantizedNote], staff: Staff) -> float:
     return duration + register * 2.0
 
 
+_PLAIN_DURATIONS = (1920, 1440, 960, 720, 480, 360, 240, 180, 120, 90, 60, 30)
+_RATIO_DURATIONS = (384, 320, 288, 192, 160, 144, 96, 80, 48, 40)
+_PLAIN_DURATION_SET = frozenset(_PLAIN_DURATIONS)
+_ATOMIC_DURATION_SET = frozenset((*_PLAIN_DURATIONS, *_RATIO_DURATIONS))
+_SHORT_SLOT_DURATIONS = tuple(value for value in _PLAIN_DURATIONS if value <= 480)
+
+
+def repair_repeated_rhythm_durations(
+    notes: list[QuantizedNote],
+    measures: list[MeasureSpan],
+    *,
+    transcription_mode: bool,
+    grid_decisions: list[GridDecision] | None = None,
+) -> tuple[list[QuantizedNote], int]:
+    """Repair short release outliers by comparing repeated beat patterns.
+
+    Attacks are substantially more reliable than releases in both performed
+    MIDI and audio transcription.  Piano writing also repeats accompaniment
+    cells constantly.  Beat groups with the same attack offsets therefore act
+    as mutual witnesses: a lone 210-tick release among repeated 240-tick cells
+    is normalized to the consensus, while a consistently short *clean* value
+    remains a real short note instead of being relabelled as staccato.
+
+    Audio mode may also snap a coherent repeated non-atomic value to the nearest
+    single notational duration.  Direct MIDI uses the more conservative exact-
+    consensus path only.
+    """
+
+    if len(notes) < 6 or not measures:
+        return notes, 0
+
+    ratio_measures = {
+        decision.measure_index
+        for decision in grid_decisions or []
+        if decision.triplet
+    }
+    occurrences: dict[
+        tuple[Staff, int],
+        dict[tuple[int, int, int, int], list[QuantizedNote]],
+    ] = defaultdict(lambda: defaultdict(list))
+    for note in notes:
+        if note.staff is None or note.grace or note.trill:
+            continue
+        location = _metric_group_at(note.onset, measures)
+        if location is not None:
+            occurrences[(note.staff, note.voice)][location].append(note)
+
+    replacements: dict[int, int] = {}
+    for lane_occurrences in occurrences.values():
+        patterns: dict[
+            tuple[int, tuple[int, ...]],
+            list[tuple[int, dict[int, list[QuantizedNote]]]],
+        ] = defaultdict(list)
+        for (measure_index, _group_index, group_start, group_length), group_notes in (
+            lane_occurrences.items()
+        ):
+            columns: dict[int, list[QuantizedNote]] = defaultdict(list)
+            for note in group_notes:
+                columns[note.onset - group_start].append(note)
+            offsets = tuple(sorted(columns))
+            if len(offsets) >= 2:
+                patterns[(group_length, offsets)].append((measure_index, columns))
+
+        for (group_length, offsets), pattern_occurrences in patterns.items():
+            if len(pattern_occurrences) < 3:
+                continue
+            uses_ratio_grid = any(
+                measure_index in ratio_measures
+                for measure_index, _columns in pattern_occurrences
+            )
+            allowed_set = _ATOMIC_DURATION_SET if uses_ratio_grid else _PLAIN_DURATION_SET
+            for offset_index, offset in enumerate(offsets):
+                next_offset = (
+                    offsets[offset_index + 1]
+                    if offset_index + 1 < len(offsets)
+                    else group_length
+                )
+                slot = next_offset - offset
+                representatives: list[tuple[list[QuantizedNote], int]] = []
+                for _measure_index, columns in pattern_occurrences:
+                    duration_counts = defaultdict(int)
+                    for note in columns[offset]:
+                        duration_counts[note.duration] += 1
+                    current, support = max(
+                        duration_counts.items(),
+                        key=lambda item: (item[1], -item[0]),
+                    )
+                    if support * 2 >= len(columns[offset]):
+                        representatives.append((columns[offset], current))
+                values = [value for _column, value in representatives]
+                if len(values) < 3:
+                    continue
+
+                value_counts: dict[int, int] = defaultdict(int)
+                for value in values:
+                    value_counts[value] += 1
+                exact_target, exact_support = max(
+                    value_counts.items(),
+                    key=lambda item: (item[1], -item[0]),
+                )
+                center = float(median(values))
+                target: int | None = None
+                if (
+                    exact_target in allowed_set
+                    and exact_target <= slot
+                    and exact_support >= 3
+                    and exact_support * 5 >= len(values) * 3
+                ):
+                    target = exact_target
+                elif transcription_mode:
+                    coherent = sum(abs(value - center) <= 60 for value in values)
+                    if coherent >= 3 and coherent * 10 >= len(values) * 7:
+                        allowed = [value for value in allowed_set if value <= slot]
+                        if allowed:
+                            if (
+                                slot in allowed_set
+                                and center not in allowed_set
+                                and 0 < slot - center <= 60
+                            ):
+                                target = slot
+                            else:
+                                target = min(
+                                    allowed,
+                                    key=lambda value: (abs(value - center), value),
+                                )
+                if target is None or abs(target - center) > 60:
+                    continue
+
+                for column, current in representatives:
+                    if current == target or abs(current - target) > 120:
+                        continue
+                    if current in allowed_set:
+                        strong_outlier = (
+                            exact_target == target
+                            and exact_support * 5 >= len(values) * 4
+                            and value_counts[current] == 1
+                        )
+                        if not strong_outlier:
+                            continue
+                    elif abs(current - center) > 60:
+                        continue
+                    for note in column:
+                        if (
+                            note.duration == current
+                            and not note.staccato
+                            and not note.tremolo_start
+                            and not note.tremolo_stop
+                        ):
+                            replacements[note.source_id] = target
+
+    if not replacements:
+        return notes, 0
+    repaired = [
+        replace(note, duration=replacements.get(note.source_id, note.duration))
+        for note in notes
+    ]
+    return (
+        sorted(repaired, key=lambda note: (note.onset, note.pitch, note.source_id)),
+        len(replacements),
+    )
+
+
 def normalize_short_gate_slots(
     notes: list[QuantizedNote],
     measures: list[MeasureSpan],
 ) -> tuple[list[QuantizedNote], int]:
-    """Normalize short-gate articulation to a full slot value + staccato dot.
+    """Normalize context-supported short gates to half-slot values + staccato.
 
     Some MIDI sources encode articulation as short gate times: a detached
     sixteenth arrives as a 32nd-long keypress.  Printed literally — or worse,
     split into a half-slot note plus a half-slot rest — the page drowns in
-    16th/32nd rests no player ever reads.  Engravers write the full slot
-    value with a staccato dot instead: the dot says "play short", and no
-    rest appears at all.  Notes inside runs (no gap after them) and
-    ratio-grid (tuplet) members stay untouched.
+    16th/32nd rests no player ever reads.  A dot is added only when repeated
+    rhythm cells or a nearby detached run support an articulation pattern.
+    Isolated short notes keep their shorter written value and do not acquire a
+    semantic staccato mark merely because the key was released early.
     """
 
     lane_attacks: dict[tuple[object, int], list[int]] = defaultdict(list)
@@ -613,39 +776,60 @@ def normalize_short_gate_slots(
     for lane in lane_attacks:
         lane_attacks[lane] = sorted(set(lane_attacks[lane]))
 
-    adjusted = 0
-    result: list[QuantizedNote] = []
+    proposed_durations: dict[int, int] = {}
+    candidate_columns: set[tuple[Staff, int, int]] = set()
     for note in notes:
+        if note.staff is not None and note.staccato:
+            candidate_columns.add((note.staff, note.voice, note.onset))
         if note.staff is None or note.grace or note.trill or note.tremolo_start or note.tremolo_stop:
-            result.append(note)
             continue
         if note.duration % 30 or note.duration >= CANONICAL_DIVISIONS // 2:
-            result.append(note)
             continue
         attacks = lane_attacks.get((note.staff, note.voice), [])
-        following = [onset for onset in attacks if onset > note.onset]
-        if not following:
-            result.append(note)
+        next_index = bisect_right(attacks, note.onset)
+        if next_index >= len(attacks):
             continue
-        slot = min(following) - note.onset
+        slot = attacks[next_index] - note.onset
         if slot <= note.duration:
-            result.append(note)
             continue
         if note.duration * 20 > slot * 11:  # gate longer than ~55% of the slot
-            result.append(note)
             continue
-        # Fill the whole inter-attack slot: a staccato dot carries the short
-        # articulation, so no padding rest is ever printed.
-        clean = [v for v in _CLEAN_BINARY if v <= slot]
+        # Preserve a real short note: the written value reaches at most half
+        # the inter-attack slot.  The staccato dot communicates the remaining
+        # articulation only when the surrounding pattern supports it.
+        clean = [value for value in _SHORT_SLOT_DURATIONS if value <= slot // 2]
         if not clean:
-            result.append(note)
             continue
         written = max(clean)
         if written <= note.duration or written % 30:
-            result.append(note)
             continue
-        result.append(replace(note, duration=written, staccato=True))
-        adjusted += 1
+        proposed_durations[note.source_id] = written
+        candidate_columns.add((note.staff, note.voice, note.onset))
+
+    supported_columns = _supported_staccato_columns(
+        notes,
+        measures,
+        candidate_columns,
+    )
+    adjusted = 0
+    result: list[QuantizedNote] = []
+    for note in notes:
+        key = (
+            (note.staff, note.voice, note.onset)
+            if note.staff is not None
+            else None
+        )
+        if key is not None and key in supported_columns:
+            written = proposed_durations.get(note.source_id)
+            if written is not None and written > note.duration:
+                result.append(replace(note, duration=written, staccato=True))
+                adjusted += 1
+            else:
+                result.append(note)
+        elif note.staccato:
+            result.append(replace(note, staccato=False))
+        else:
+            result.append(note)
 
     return (
         sorted(result, key=lambda note: (note.onset, note.pitch, note.source_id)),
@@ -653,13 +837,110 @@ def normalize_short_gate_slots(
     )
 
 
-_CLEAN_BINARY = (480, 360, 240, 180, 120, 90, 60, 30)
+def _supported_staccato_columns(
+    notes: list[QuantizedNote],
+    measures: list[MeasureSpan],
+    candidates: set[tuple[Staff, int, int]],
+) -> set[tuple[Staff, int, int]]:
+    if not candidates:
+        return set()
+
+    supported: set[tuple[Staff, int, int]] = set()
+    lane_attacks: dict[tuple[Staff, int], set[int]] = defaultdict(set)
+    for note in notes:
+        if note.staff is not None and not note.grace and not note.trill:
+            lane_attacks[(note.staff, note.voice)].add(note.onset)
+    for lane, attacks in lane_attacks.items():
+        run: list[int] = []
+        for onset in sorted(attacks):
+            key = (lane[0], lane[1], onset)
+            if key in candidates and (
+                not run or onset - run[-1] <= CANONICAL_DIVISIONS
+            ):
+                run.append(onset)
+                continue
+            if len(run) >= 3:
+                supported.update((lane[0], lane[1], value) for value in run)
+            run = [onset] if key in candidates else []
+        if len(run) >= 3:
+            supported.update((lane[0], lane[1], value) for value in run)
+
+    occurrences: dict[
+        tuple[Staff, int],
+        dict[tuple[int, int, int, int], list[QuantizedNote]],
+    ] = defaultdict(lambda: defaultdict(list))
+    for note in notes:
+        if note.staff is None:
+            continue
+        location = _metric_group_at(note.onset, measures)
+        if location is not None:
+            occurrences[(note.staff, note.voice)][location].append(note)
+
+    for lane, lane_occurrences in occurrences.items():
+        patterns: dict[
+            tuple[int, tuple[int, ...]],
+            list[tuple[int, list[QuantizedNote]]],
+        ] = defaultdict(list)
+        for (_measure_index, _group_index, group_start, group_length), group_notes in (
+            lane_occurrences.items()
+        ):
+            offsets = tuple(sorted({note.onset - group_start for note in group_notes}))
+            if offsets:
+                patterns[(group_length, offsets)].append((group_start, group_notes))
+        for (_group_length, _offsets), pattern_occurrences in patterns.items():
+            if len(pattern_occurrences) < 3:
+                continue
+            counts: dict[int, int] = defaultdict(int)
+            for group_start, group_notes in pattern_occurrences:
+                candidate_offsets = {
+                    note.onset - group_start
+                    for note in group_notes
+                    if (note.staff, note.voice, note.onset) in candidates
+                }
+                for offset in candidate_offsets:
+                    counts[offset] += 1
+            repeated_offsets = {
+                offset
+                for offset, count in counts.items()
+                if count >= 3 and count * 2 >= len(pattern_occurrences)
+            }
+            for group_start, _group_notes in pattern_occurrences:
+                for offset in repeated_offsets:
+                    key = (lane[0], lane[1], group_start + offset)
+                    if key in candidates:
+                        supported.add(key)
+    return supported
+
+
+def _metric_group_at(
+    tick: int,
+    measures: list[MeasureSpan],
+) -> tuple[int, int, int, int] | None:
+    if not measures:
+        return None
+    measure_index = measure_index_at(measures, tick)
+    measure = measures[measure_index]
+    if measure.implicit:
+        return None
+    relative = tick - measure.start
+    boundaries = measure.meter.beat_group_boundaries
+    for group_index, (start, end) in enumerate(zip(boundaries, boundaries[1:], strict=False)):
+        if start <= relative < end:
+            return (
+                measure_index,
+                group_index,
+                measure.start + start,
+                end - start,
+            )
+    return None
 
 
 def absorb_articulation_gaps(
     notes: list[QuantizedNote],
     *,
     max_gap: int = 120,
+    measures: list[MeasureSpan] | None = None,
+    grid_decisions: list[GridDecision] | None = None,
 ) -> tuple[list[QuantizedNote], int]:
     """Swallow articulation gaps into the preceding note.
 
@@ -675,6 +956,11 @@ def absorb_articulation_gaps(
         if note.staff is not None:
             lanes[(note.staff, note.voice)].append(note)
 
+    ratio_measures = {
+        decision.measure_index
+        for decision in grid_decisions or []
+        if decision.triplet
+    }
     absorbed = 0
     swallow: dict[int, int] = {}
     for lane_notes in lanes.values():
@@ -683,8 +969,14 @@ def absorb_articulation_gaps(
             if current.grace or current.trill or current.tremolo_start or current.tremolo_stop:
                 continue
             gap = following.onset - (current.onset + current.duration)
-            if 0 < gap <= max_gap:
-                swallow[id(current)] = following.onset - current.onset
+            target_duration = following.onset - current.onset
+            allowed = _PLAIN_DURATION_SET
+            if measures is not None:
+                measure_index = measure_index_at(measures, current.onset)
+                if measure_index in ratio_measures:
+                    allowed = _ATOMIC_DURATION_SET
+            if 0 < gap <= max_gap and target_duration in allowed:
+                swallow[id(current)] = target_duration
                 absorbed += 1
 
     if not absorbed:

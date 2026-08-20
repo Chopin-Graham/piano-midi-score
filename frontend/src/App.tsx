@@ -1,5 +1,6 @@
 import { ChangeEvent, DragEvent, useMemo, useState } from "react";
 
+import packageMetadata from "../package.json";
 import { convertDemo, convertMedia, convertMidi } from "./api";
 import { ScorePreview } from "./components/ScorePreview";
 import {
@@ -150,7 +151,9 @@ export default function App() {
           <h1>Piano MIDI Score</h1>
           <p>从 MIDI、音频或视频整理出真正可读的钢琴谱</p>
         </div>
-        <div className="privacy-pill">本地处理 · A4 PDF + MusicXML</div>
+        <div className="privacy-pill">
+          v{packageMetadata.version} · 本地处理 · A4 PDF + MusicXML
+        </div>
       </header>
 
       <main className="workspace">

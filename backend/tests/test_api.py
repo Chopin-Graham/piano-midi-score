@@ -4,6 +4,7 @@ import base64
 import httpx
 
 import app.main as main_module
+from app import __version__
 from app.core.media_transcription import MediaTranscriptionResult
 from app.main import app
 
@@ -24,6 +25,7 @@ def test_health() -> None:
     response = request("GET", "/api/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+    assert response.json()["version"] == __version__
     assert "engraver" in response.json()
     assert "transcriber" in response.json()
 

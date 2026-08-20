@@ -749,26 +749,6 @@ def _select_timeline_mapper(
     source_tempo = max(40.0, min(220.0, source_tempo))
     attack_times = sorted({round(note.start, 6) for note in notes})
 
-    # A genuinely rubato performance (slow opening, cadenza accelerando,
-    # ritardando) must not be flattened onto one constant grid: the note-driven
-    # timeline follows the performed tempo curve.  Prefer it whenever it finds
-    # meaningful sustained variation; steady performances keep the tighter
-    # grid-fit selection below.
-    ioi_result = _ioi_timeline_mapper(notes, source_tempo)
-    if ioi_result is not None:
-        ioi_mapper, ioi_tempo = ioi_result
-        if _has_sustained_tempo_variation(ioi_mapper, attack_times):
-            return (
-                ioi_mapper,
-                ioi_tempo,
-                "ioi_dynamic_tempo_map",
-                {
-                    "source_tempo_bpm": round(source_tempo, 3),
-                    "tempo_selection_reason": "performed_tempo_variation_detected",
-                    "tempo_candidates": [],
-                },
-            )
-
     candidates: list[tuple[str, float, Callable[[float], float], bool]] = []
     constant_tempos: list[tuple[str, float]] = [
         ("constant_tempo_source", source_tempo),
@@ -784,12 +764,6 @@ def _select_timeline_mapper(
             constant_tempos.append(("constant_tempo_beats_half", beat_tempo / 2))
         if beat_tempo * 2 <= 220:
             constant_tempos.append(("constant_tempo_beats_double", beat_tempo * 2))
-
-    # The note-driven timeline is offered to the selection below only as a
-    # candidate; the rubato gate above already preferred it when variation is
-    # real.
-    if ioi_result is not None:
-        candidates.append(("ioi_dynamic_tempo_map", ioi_result[1], ioi_result[0], True))
 
     seen_tempos: list[float] = []
     for method, tempo in constant_tempos:
@@ -939,91 +913,6 @@ def _best_rhythm_phase(
     assert best is not None
     score, phase, grid_name, error, hit_rate = best
     return phase, grid_name, error, hit_rate, score
-
-
-def _has_sustained_tempo_variation(
-    mapper: Callable[[float], float],
-    attack_times: list[float],
-) -> bool:
-    """Whether the note-driven timeline bends its tempo for real.
-
-    Sample the mapper's local slope (beats per second) along the piece; a
-    steady performance stays near the median, while a rubato opening or a
-    ritardando pushes a sustained region well past it.  Used to prefer the
-    note-driven timeline only when the performance actually changes tempo.
-    """
-
-    if len(attack_times) < 24:
-        return False
-    step = max(1, len(attack_times) // 12)
-    slopes: list[float] = []
-    for index in range(0, len(attack_times) - step, step):
-        t0 = attack_times[index]
-        t1 = attack_times[index + step]
-        b0 = mapper(t0)
-        b1 = mapper(t1)
-        if t1 > t0:
-            slopes.append((b1 - b0) / (t1 - t0))
-    if len(slopes) < 6:
-        return False
-    base = median(slopes)
-    if base <= 0:
-        return False
-    deviating = sum(1 for slope in slopes if abs(slope - base) / base > 0.15)
-    return deviating >= 2 and deviating <= len(slopes) - 2
-
-
-def _ioi_timeline_mapper(
-    notes: list[_TimedNote],
-    source_tempo: float,
-) -> tuple[Callable[[float], float], float] | None:
-    """Build a seconds→beats mapper from the notes' own subdivision rate.
-
-    Beat trackers lose lock in rubato and then crush a slow opening/cadenza
-    onto the main-tempo grid.  The performed subdivision (the local tatum) is
-    readable from the inter-onset intervals no matter how free the playing
-    is: tatum ≈ sixteenth, so local tempo ≈ 60 / (tatum × 4).  Integrating
-    that curve yields a timeline that follows the actual tempo, including the
-    slow opening and the accelerando into the theme.
-    """
-
-    onsets = sorted({round(note.start, 5) for note in notes})
-    if len(onsets) < 24:
-        return None
-    # Ignore ornament gaps (rolled chords, grace notes): the tatum is the
-    # local *structural* subdivision, so only intervals above ~a 64th count.
-    iois = [b - a for a, b in zip(onsets, onsets[1:], strict=False) if b - a > 0.05]
-    if len(iois) < 20:
-        return None
-
-    def local_tatum(index: int) -> float:
-        window = iois[max(0, index - 3) : index + 4]
-        return sorted(window)[max(0, len(window) * 30 // 100)]
-
-    raw_tempos = [60.0 / (max(0.05, local_tatum(i)) * 4.0) for i in range(len(iois))]
-    clamped = [min(max(t, 24.0), 260.0) for t in raw_tempos]
-    smoothed = [median(clamped[max(0, i - 3) : i + 4]) for i in range(len(clamped))]
-
-    # Integrate the tempo curve into cumulative beats at each ioi boundary.
-    knots: list[tuple[float, float]] = [(onsets[0], 0.0)]
-    beats = 0.0
-    for i, ioi in enumerate(iois):
-        beats += ioi * (smoothed[i] / 60.0)
-        knots.append((onsets[i + 1], beats))
-
-    times = [k[0] for k in knots]
-    beat_values = [k[1] for k in knots]
-
-    def mapper(seconds: float) -> float:
-        index = bisect.bisect_right(times, seconds) - 1
-        index = max(0, min(index, len(times) - 2))
-        left_t, left_b = times[index], beat_values[index]
-        right_t, right_b = times[index + 1], beat_values[index + 1]
-        fraction = 0.0 if right_t <= left_t else (seconds - left_t) / (right_t - left_t)
-        return left_b + fraction * (right_b - left_b)
-
-    total_tempo = 60.0 * (beat_values[-1] / max(times[-1] - times[0], 0.001))
-    return mapper, total_tempo
 
 
 def _beat_mapper(
@@ -1216,8 +1105,7 @@ def _mapper_tempo_events(
     onsets = sorted(note.start for note in notes)
     if len(onsets) < 24:
         return []
-    step = max(1, len(onsets) // 60
-    )
+    step = max(1, len(onsets) // 60)
     slopes: list[tuple[float, float]] = []
     for index in range(0, len(onsets) - step, step):
         t0, t1 = onsets[index], onsets[index + step]
@@ -1265,13 +1153,15 @@ def _write_aligned_midi(
     meta_track = mido.MidiTrack()
     note_track = mido.MidiTrack()
     midi.tracks.extend([meta_track, note_track])
-    # A slow opening should print its own tempo at the start, not the piece's
-    # median speed: when the first marked region begins within the opening
-    # measure, lead with that region's tempo.
+    # A tempo region may replace the initial mark only when it genuinely starts
+    # in the opening measure.  tempo_events stores quarter-note positions, not
+    # ticks; comparing it with CANONICAL_DIVISIONS used to treat practically
+    # every later event as an opening event and printed the wrong initial BPM.
     opening_bpm = tempo_bpm
     if tempo_events:
         first_quarters, first_bpm = tempo_events[0]
-        if first_quarters <= CANONICAL_DIVISIONS * 4:
+        opening_measure_quarters = meter_numerator * 4.0 / meter_denominator
+        if first_quarters < opening_measure_quarters:
             opening_bpm = max(20.0, first_bpm)
     meta_track.append(mido.MetaMessage("track_name", name="Tempo and meter", time=0))
     meta_track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(opening_bpm), time=0))

@@ -12,14 +12,15 @@ from collections import defaultdict
 from dataclasses import replace
 from statistics import median
 
-from .models import CANONICAL_DIVISIONS, QuantizedNote, Staff
+from .models import CANONICAL_DIVISIONS, QuantizedNote, Staff, TempoChange
 
 MIN_TRILL_ATTACKS = 6
 MIN_TRILL_SPAN = (CANONICAL_DIVISIONS * 3) // 4  # about a dotted quarter of alternation
-# A performed trill alternates at sixteenth-note speed or faster; an
-# eighth-speed two-pitch figure is a measured ornament, not a trill, and
-# writing "tr" over it puts a mark no editor expects.
-MAX_TRILL_MEMBER = CANONICAL_DIVISIONS // 4  # members are sixteenth-note or faster
+# A written sixteenth-note alternation is normally a measured figure, not a
+# trill.  Candidates must be 32nd-note-or-faster *and* rapid in real time; the
+# latter condition prevents a very slow-tempo 32nd pattern from acquiring tr.
+MAX_TRILL_MEMBER = CANONICAL_DIVISIONS // 8
+MAX_TRILL_INTERVAL_SECONDS = 0.15
 
 MIN_TREMOLO_ATTACKS = 8
 MAX_TREMOLO_SPACING = CANONICAL_DIVISIONS // 8  # 32nd-note speed or faster
@@ -123,6 +124,8 @@ def convert_grace_notes(
 
 def collapse_trills(
     notes: list[QuantizedNote],
+    *,
+    tempo_changes: list[TempoChange] | None = None,
 ) -> tuple[list[QuantizedNote], int, int]:
     """Merge measured two-pitch alternations into single trill-marked notes.
 
@@ -139,7 +142,11 @@ def collapse_trills(
     absorbed = 0
     for staff in (Staff.RIGHT, Staff.LEFT):
         staff_notes = [note for note in notes if note.staff == staff]
-        kept, found, merged = _collapse_staff_trills(staff_notes, staff)
+        kept, found, merged = _collapse_staff_trills(
+            staff_notes,
+            staff,
+            tempo_changes or [],
+        )
         collapsed.extend(kept)
         trill_count += found
         absorbed += merged
@@ -153,6 +160,7 @@ def collapse_trills(
 def _collapse_staff_trills(
     notes: list[QuantizedNote],
     staff: Staff,
+    tempo_changes: list[TempoChange],
 ) -> tuple[list[QuantizedNote], int, int]:
     columns: dict[int, list[QuantizedNote]] = defaultdict(list)
     for note in notes:
@@ -174,7 +182,7 @@ def _collapse_staff_trills(
     absorbed = 0
     index = 0
     while index < len(edge_events):
-        run = _trill_run(edge_events, index)
+        run = _trill_run(edge_events, index, tempo_changes)
         if run is None:
             index += 1
             continue
@@ -204,6 +212,7 @@ def _collapse_staff_trills(
 def _trill_run(
     edge_events: list[QuantizedNote],
     start: int,
+    tempo_changes: list[TempoChange],
 ) -> tuple[list[QuantizedNote], int] | None:
     first = edge_events[start]
     if start + 1 >= len(edge_events):
@@ -236,7 +245,20 @@ def _trill_run(
         return None
     if any(note.duration > MAX_TRILL_MEMBER for note in members):
         return None
+    tempo_bpm = _tempo_at(members[0].onset, tempo_changes)
+    interval_seconds = typical / CANONICAL_DIVISIONS * 60.0 / tempo_bpm
+    if interval_seconds > MAX_TRILL_INTERVAL_SECONDS:
+        return None
     return members, index
+
+
+def _tempo_at(tick: int, tempo_changes: list[TempoChange]) -> float:
+    tempo = 120.0
+    for change in tempo_changes:
+        if change.tick > tick:
+            break
+        tempo = change.bpm
+    return max(20.0, tempo)
 
 
 def collapse_tremolos(

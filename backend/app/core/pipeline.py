@@ -10,6 +10,7 @@ from .clefs import plan_clefs
 from .duration_simplifier import (
     absorb_articulation_gaps,
     normalize_short_gate_slots,
+    repair_repeated_rhythm_durations,
     simplify_polyphonic_durations,
 )
 from .dynamics import plan_dynamics
@@ -155,19 +156,25 @@ def convert_midi_with_score(
             f"依据实际动态谱号，将 {clef_aware_repairs} 个仍会产生极端加线的音移到另一谱表"
         )
     physical_notes = notes
+    tempo_bpm = parsed.tempos[0].bpm
+    tempo_changes = _tempo_timeline(parsed, measures, scale=scale, timeline_shift=shift)
+    tempo_ramps = _tempo_ramps(tempo_changes)
+    tempo_texts = [
+        TempoText(text_tick, kind)
+        for text_tick, _start, _end, kind in tempo_ramps
+    ]
     trill_count = 0
     trill_absorbed = 0
     if options.audio_transcription:
-        notes, trill_count, trill_absorbed = collapse_trills(notes)
+        notes, trill_count, trill_absorbed = collapse_trills(
+            notes,
+            tempo_changes=tempo_changes,
+        )
         if trill_count:
             warnings.append(
                 f"检测到 {trill_count} 处快速二度交替，已按颤音记号书写"
                 f"（合并 {trill_absorbed} 个重复攻击音，总时值不变）"
             )
-    tempo_bpm = parsed.tempos[0].bpm
-    tempo_changes = _tempo_timeline(parsed, measures, scale=scale, timeline_shift=shift)
-    tempo_ramps = _tempo_ramps(tempo_changes)
-    tempo_texts = [TempoText(text_tick, kind) for text_tick, _start, _end, kind in tempo_ramps]
     tremolo_count = 0
     tremolo_absorbed = 0
     if not options.audio_transcription:
@@ -203,11 +210,29 @@ def convert_midi_with_score(
     notes, voice_counts, voice_warnings = assign_voices(notes, options.max_voices_per_staff)
     warnings.extend(voice_warnings)
 
+    repeated_rhythm_repairs = 0
+    if options.style != "faithful":
+        notes, repeated_rhythm_repairs = repair_repeated_rhythm_durations(
+            notes,
+            measures,
+            transcription_mode=options.audio_transcription,
+            grid_decisions=grid_decisions,
+        )
+        if repeated_rhythm_repairs:
+            warnings.append(
+                f"参考重复节奏型，已修复 {repeated_rhythm_repairs} 个异常短暂延长或缩短的音符时值"
+            )
+
     short_gate_normalized = 0
+    gaps_absorbed = 0
     if options.style != "faithful":
         notes, short_gate_normalized = normalize_short_gate_slots(notes, measures)
         if options.audio_transcription:
-            notes, gaps_absorbed = absorb_articulation_gaps(notes)
+            notes, gaps_absorbed = absorb_articulation_gaps(
+                notes,
+                measures=measures,
+                grid_decisions=grid_decisions,
+            )
             if gaps_absorbed:
                 warnings.append(
                     f"已将 {gaps_absorbed} 处演奏缝隙并入前音时值（不再产生短休止符）"
@@ -227,6 +252,21 @@ def convert_midi_with_score(
             f"为消除同声部时间重叠，调整了 {overlap_clipped} 个音的书写时值"
             + (f"，裁掉 {overlap_dropped} 个无法书写的极短音" if overlap_dropped else "")
         )
+    duration_analysis.update(
+        {
+            "repeated_rhythm_repair_count": repeated_rhythm_repairs,
+            "short_gate_normalized_note_count": short_gate_normalized,
+            "articulation_gap_absorbed_count": gaps_absorbed,
+            "staccato_note_count": sum(note.staccato for note in notes),
+            "staccato_column_count": len(
+                {
+                    (note.staff, note.voice, note.onset)
+                    for note in notes
+                    if note.staff is not None and note.staccato
+                }
+            ),
+        }
+    )
 
     key, key_changes, key_warnings = _key_timeline(
         parsed.key_signatures,

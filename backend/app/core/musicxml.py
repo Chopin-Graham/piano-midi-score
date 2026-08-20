@@ -6,6 +6,7 @@ from functools import cache
 from statistics import median
 from xml.etree import ElementTree as ET
 
+from .. import __version__
 from .meter_map import measure_index_at
 from .models import (
     CANONICAL_DIVISIONS,
@@ -363,7 +364,7 @@ def _add_work_and_identification(root: ET.Element, score: ScoreModel) -> None:
     ET.SubElement(work, "work-title").text = score.title
     identification = ET.SubElement(root, "identification")
     encoding = ET.SubElement(identification, "encoding")
-    ET.SubElement(encoding, "software").text = "Piano MIDI Score 0.1.0"
+    ET.SubElement(encoding, "software").text = f"Piano MIDI Score {__version__}"
     supports = ET.SubElement(encoding, "supports", element="print", type="yes")
     supports.set("attribute", "new-system")
     supports.set("value", "yes")
@@ -2420,6 +2421,7 @@ def _write_item(
             tie_start=notation_note.tie_start,
         )
 
+        chord_staccato = note_index == 0 and any(note.staccato for note in item.notes)
         if (
             notation_note.tie_stop
             or notation_note.tie_start
@@ -2427,7 +2429,7 @@ def _write_item(
             or item.tuplet_stop
             or notation_note.arpeggiated
             or notation_note.trill
-            or notation_note.staccato
+            or chord_staccato
             or notation_note.tremolo_start
             or notation_note.tremolo_stop
         ):
@@ -2445,7 +2447,7 @@ def _write_item(
             if notation_note.trill:
                 ornaments = ET.SubElement(notations, "ornaments")
                 ET.SubElement(ornaments, "trill-mark")
-            if notation_note.staccato:
+            if chord_staccato:
                 articulations = ET.SubElement(notations, "articulations")
                 ET.SubElement(articulations, "staccato")
             if notation_note.tremolo_start or notation_note.tremolo_stop:

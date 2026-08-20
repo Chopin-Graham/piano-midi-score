@@ -166,3 +166,54 @@ def test_per_lane_per_beat_grids_keep_quintuplet_run_exact() -> None:
     assert [note.onset for note in run] == [0, 96, 192, 288, 384]
     assert all(note.duration == 96 for note in run)
     assert any(decision.triplet for decision in decisions)
+
+
+def test_audio_sparse_timing_jitter_does_not_select_64th_grid() -> None:
+    notes: list[RawNote] = []
+    for measure in range(6):
+        base = measure * 1920
+        for beat in range(4):
+            beat_start = base + beat * 480
+            jitter = 18 if (measure + beat) % 2 else -14
+            for onset in (beat_start + 16, beat_start + 240 + jitter):
+                notes.append(
+                    RawNote(len(notes), 60 + beat % 5, onset, onset + 105, 80, 0, 0)
+                )
+
+    quantized, decisions, _, _ = quantize_midi(
+        _audio_parsed(notes),
+        Meter(4, 4),
+        ConversionOptions(
+            style="clean",
+            audio_transcription=True,
+            allow_triplets=False,
+        ),
+    )
+
+    assert all(note.onset % 120 == 0 for note in quantized)
+    assert all(decision.step >= 120 for decision in decisions)
+
+
+def test_audio_true_32nd_run_keeps_fine_grid() -> None:
+    notes: list[RawNote] = []
+    for measure in range(2):
+        base = measure * 1920
+        for beat in range(4):
+            for member in range(8):
+                onset = base + beat * 480 + member * 60
+                notes.append(
+                    RawNote(len(notes), 60 + member % 7, onset, onset + 50, 82, 0, 0)
+                )
+
+    quantized, decisions, _, _ = quantize_midi(
+        _audio_parsed(notes),
+        Meter(4, 4),
+        ConversionOptions(
+            style="clean",
+            audio_transcription=True,
+            allow_triplets=False,
+        ),
+    )
+
+    assert len({note.onset for note in quantized}) == 64
+    assert any(decision.step <= 60 for decision in decisions)

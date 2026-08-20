@@ -13,6 +13,7 @@ from app.core.media_transcription import (
     _postprocess_midi,
     _select_timeline_mapper,
     _TimedNote,
+    _write_aligned_midi,
 )
 
 from .midi_factory import piano_midi_bytes
@@ -302,48 +303,53 @@ def test_attack_column_window_preserves_fast_thirty_seconds() -> None:
     assert analysis["attack_columns_after"] < analysis["attack_columns_before"]
 
 
-def test_ioi_timeline_recovers_slow_opening_and_theme_tempo() -> None:
-    from app.core.media_transcription import (
-        _has_sustained_tempo_variation,
-        _ioi_timeline_mapper,
+def test_tempo_selector_does_not_treat_note_density_as_tempo() -> None:
+    # The pulse stays at 120 BPM.  Only the written texture changes from
+    # eighths to sixteenths; a note-IOI time warp would incorrectly halve the
+    # first region or double the second one.
+    notes: list[_TimedNote] = []
+    for beat in range(16):
+        subdivisions = 2 if beat < 8 else 4
+        for subdivision in range(subdivisions):
+            start = beat * 0.5 + subdivision * 0.5 / subdivisions
+            notes.append(
+                _TimedNote(60 + (beat + subdivision) % 8, start, start + 0.1, 76)
+            )
+    beat_times = [index * 0.5 for index in range(18)]
+
+    mapper, tempo, method, analysis = _select_timeline_mapper(
+        beat_times,
+        notes,
+        source_tempo=120.0,
     )
 
-    # Opening: slow sixteenth-motion (~68 BPM), then a faster 16th theme.
-    notes: list[_TimedNote] = []
-    t = 0.0
-    for step in range(16):
-        notes.append(_TimedNote(60 + (step % 8), t, t + 0.18, 70))
-        t += 0.22  # sixteenths at 68 BPM
-    for index in range(60):
-        notes.append(_TimedNote(60 + (index % 8), t, t + 0.2, 70))
-        t += 0.116  # sixteenths at 129 BPM
-
-    mapper, tempo = _ioi_timeline_mapper(notes, 120.0)
-    attacks = sorted(note.start for note in notes)
-
-    opening_bps = mapper(attacks[1]) / max(attacks[1], 1e-6)
-    theme_bps = (mapper(attacks[-1]) - mapper(attacks[20])) / (attacks[-1] - attacks[20])
-    opening_bpm = opening_bps * 60
-    theme_bpm = theme_bps * 60
-
-    assert 45.0 < opening_bpm < 95.0
-    assert 110.0 < theme_bpm < 160.0
-    assert _has_sustained_tempo_variation(mapper, attacks)
-
-
-def test_ioi_timeline_stays_quiet_for_steady_performance() -> None:
-    from app.core.media_transcription import (
-        _has_sustained_tempo_variation,
-        _ioi_timeline_mapper,
+    first = min(note.start for note in notes)
+    last = max(note.start for note in notes)
+    assert method in {"constant_tempo_source", "librosa_dynamic_beat_warp"}
+    assert 118.0 <= tempo <= 122.0
+    assert abs((mapper(last) - mapper(first)) - (last - first) * 2.0) < 0.25
+    assert all(
+        candidate["method"] != "ioi_dynamic_tempo_map"
+        for candidate in analysis["tempo_candidates"]
     )
 
-    notes: list[_TimedNote] = []
-    t = 0.0
-    for index in range(80):
-        notes.append(_TimedNote(60 + (index % 8), t, t + 0.2, 70))
-        t += 0.116  # steady sixteenths
 
-    mapper, _ = _ioi_timeline_mapper(notes, 120.0)
-    attacks = sorted(note.start for note in notes)
+def test_late_tempo_region_does_not_replace_initial_tempo() -> None:
+    midi_bytes = _write_aligned_midi(
+        [_TimedNote(60, 0.0, 1.0, 80)],
+        [],
+        lambda seconds: seconds * 2.0,
+        120.0,
+        "test",
+        # The first tick of measure 2 is no longer part of the opening measure.
+        tempo_events=[(4.0, 80.0)],
+    )
+    midi = mido.MidiFile(file=BytesIO(midi_bytes))
+    tempo_messages = [
+        message
+        for message in midi.tracks[0]
+        if message.type == "set_tempo"
+    ]
 
-    assert not _has_sustained_tempo_variation(mapper, attacks)
+    assert round(mido.tempo2bpm(tempo_messages[0].tempo)) == 120
+    assert round(mido.tempo2bpm(tempo_messages[1].tempo)) == 80

@@ -165,7 +165,11 @@ def quantize_midi(
         bucket_grids: dict[tuple[int, tuple[int, int]], GridSpec] = {}
         for bucket_key, bucket_notes in buckets.items():
             bucket_start = measure.start + measure.meter.beat_group_boundaries[bucket_key[0]]
-            bucket_candidates = candidates
+            bucket_candidates = [
+                grid
+                for grid in candidates
+                if _fine_grid_has_attack_evidence(bucket_notes, grid, options)
+            ] or candidates
             best = min(
                 bucket_candidates,
                 key=lambda grid: _grid_cost(
@@ -303,6 +307,41 @@ def _grid_candidates(options: ConversionOptions, meter: Meter | None = None) -> 
         for spec in all_specs
         if spec.name in allowed
     ]
+
+
+def _fine_grid_has_attack_evidence(
+    notes: list[QuantizedNote],
+    grid: GridSpec,
+    options: ConversionOptions,
+) -> bool:
+    """Require an actual fast run before audio uses 32nd/64th grids.
+
+    Audio releases and isolated attacks routinely drift by 20--40 ticks.  A
+    sparse beat bucket can therefore fit a 64th grid perfectly even though its
+    musical pattern is only eighths or sixteenths.  Fine grids remain available
+    for real runs, but auto mode now requires at least two consecutive rapid
+    gaps inside the beat.  An explicit minimum-note choice and faithful MIDI
+    conversion continue to honor the user's requested detail level.
+    """
+
+    if (
+        not options.audio_transcription
+        or options.minimum_note != "auto"
+        or options.style == "faithful"
+        or grid.step >= CANONICAL_DIVISIONS // 4
+    ):
+        return True
+
+    onsets = sorted({note.onset for note in notes})
+    required_onsets = 4 if grid.step <= CANONICAL_DIVISIONS // 16 else 3
+    if len(onsets) < required_onsets:
+        return False
+
+    rapid_limit = min(110, round(grid.step * 1.5))
+    rapid_gaps = sum(
+        second - first <= rapid_limit for first, second in pairwise(onsets)
+    )
+    return rapid_gaps >= 2
 
 
 def _grid_cost(

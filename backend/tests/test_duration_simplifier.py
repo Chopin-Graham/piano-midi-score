@@ -1,4 +1,9 @@
-from app.core.duration_simplifier import simplify_polyphonic_durations
+from app.core.duration_simplifier import (
+    absorb_articulation_gaps,
+    normalize_short_gate_slots,
+    repair_repeated_rhythm_durations,
+    simplify_polyphonic_durations,
+)
 from app.core.models import (
     GridDecision,
     MeasureSpan,
@@ -400,8 +405,6 @@ def test_audio_transcription_release_cell_follows_triplet_grid() -> None:
 
 
 def test_absorb_articulation_gaps_swallows_short_silences() -> None:
-    from app.core.duration_simplifier import absorb_articulation_gaps
-
     notes = [
         QuantizedNote(1, 60, 0, 180, 80, 0, 0, Staff.RIGHT),
         QuantizedNote(2, 62, 240, 120, 80, 0, 0, Staff.RIGHT),
@@ -418,8 +421,6 @@ def test_absorb_articulation_gaps_swallows_short_silences() -> None:
 
 
 def test_absorb_articulation_gaps_leaves_long_gaps_alone() -> None:
-    from app.core.duration_simplifier import absorb_articulation_gaps
-
     notes = [
         QuantizedNote(1, 60, 0, 240, 80, 0, 0, Staff.RIGHT),
         QuantizedNote(2, 62, 960, 240, 80, 0, 0, Staff.RIGHT),
@@ -429,3 +430,152 @@ def test_absorb_articulation_gaps_leaves_long_gaps_alone() -> None:
 
     assert count == 0
     assert absorbed[0].duration == 240
+
+
+def test_repeated_rhythm_repairs_consistent_release_noise() -> None:
+    meter = Meter(4, 4)
+    measures = [
+        MeasureSpan(index, index * meter.measure_length, meter.measure_length, meter)
+        for index in range(3)
+    ]
+    notes: list[QuantizedNote] = []
+    for measure in measures:
+        notes.extend(
+            [
+                QuantizedNote(
+                    len(notes) + 1,
+                    60,
+                    measure.start,
+                    210,
+                    80,
+                    0,
+                    0,
+                    Staff.RIGHT,
+                    voice=1,
+                ),
+                QuantizedNote(
+                    len(notes) + 2,
+                    64,
+                    measure.start + 240,
+                    240,
+                    80,
+                    0,
+                    0,
+                    Staff.RIGHT,
+                    voice=1,
+                ),
+            ]
+        )
+
+    repaired, count = repair_repeated_rhythm_durations(
+        notes,
+        measures,
+        transcription_mode=True,
+    )
+
+    assert count == 3
+    assert [note.duration for note in repaired if note.pitch == 60] == [240, 240, 240]
+
+
+def test_repeated_rhythm_repairs_one_overlong_release() -> None:
+    meter = Meter(4, 4)
+    measures = [
+        MeasureSpan(index, index * meter.measure_length, meter.measure_length, meter)
+        for index in range(3)
+    ]
+    notes: list[QuantizedNote] = []
+    for index, measure in enumerate(measures):
+        notes.extend(
+            [
+                QuantizedNote(
+                    len(notes) + 1,
+                    60,
+                    measure.start,
+                    270 if index == 0 else 240,
+                    80,
+                    0,
+                    0,
+                    Staff.RIGHT,
+                    voice=1,
+                ),
+                QuantizedNote(
+                    len(notes) + 2,
+                    64,
+                    measure.start + 240,
+                    240,
+                    80,
+                    0,
+                    0,
+                    Staff.RIGHT,
+                    voice=1,
+                ),
+            ]
+        )
+
+    repaired, count = repair_repeated_rhythm_durations(
+        notes,
+        measures,
+        transcription_mode=True,
+    )
+
+    assert count == 1
+    assert [note.duration for note in repaired if note.pitch == 60] == [240, 240, 240]
+
+
+def test_isolated_short_gate_stays_short_without_staccato() -> None:
+    meter = Meter(4, 4)
+    measures = [MeasureSpan(0, 0, meter.measure_length, meter)]
+    notes = [
+        QuantizedNote(1, 60, 0, 120, 80, 0, 0, Staff.RIGHT, voice=1),
+        QuantizedNote(2, 62, 480, 240, 82, 0, 0, Staff.RIGHT, voice=1),
+    ]
+
+    normalized, count = normalize_short_gate_slots(notes, measures)
+
+    assert count == 0
+    assert normalized[0].duration == 120
+    assert not normalized[0].staccato
+
+
+def test_two_short_gates_do_not_form_a_detached_run() -> None:
+    meter = Meter(4, 4)
+    measures = [MeasureSpan(0, 0, meter.measure_length, meter)]
+    notes = [
+        QuantizedNote(1, 60, 0, 120, 80, 0, 0, Staff.RIGHT, voice=1),
+        QuantizedNote(2, 62, 480, 120, 80, 0, 0, Staff.RIGHT, voice=1),
+        QuantizedNote(3, 64, 960, 240, 80, 0, 0, Staff.RIGHT, voice=1),
+    ]
+
+    normalized, count = normalize_short_gate_slots(notes, measures)
+
+    assert count == 0
+    assert [note.duration for note in normalized[:2]] == [120, 120]
+    assert not any(note.staccato for note in normalized)
+
+
+def test_repeated_short_gate_pattern_earns_staccato() -> None:
+    meter = Meter(4, 4)
+    measures = [MeasureSpan(0, 0, meter.measure_length, meter)]
+    notes = [
+        QuantizedNote(index + 1, 60 + index, index * 480, 120, 80, 0, 0, Staff.RIGHT)
+        for index in range(4)
+    ]
+
+    normalized, count = normalize_short_gate_slots(notes, measures)
+
+    assert count == 3
+    assert all(note.duration == 240 for note in normalized[:3])
+    assert all(note.staccato for note in normalized[:3])
+    assert not normalized[3].staccato
+
+
+def test_absorb_articulation_gaps_rejects_non_atomic_duration() -> None:
+    notes = [
+        QuantizedNote(1, 60, 0, 180, 80, 0, 0, Staff.RIGHT),
+        QuantizedNote(2, 62, 210, 120, 80, 0, 0, Staff.RIGHT),
+    ]
+
+    absorbed, count = absorb_articulation_gaps(notes)
+
+    assert count == 0
+    assert absorbed[0].duration == 180

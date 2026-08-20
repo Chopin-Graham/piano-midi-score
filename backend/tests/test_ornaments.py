@@ -10,6 +10,7 @@ from app.core.models import (
     QuantizedNote,
     ScoreModel,
     Staff,
+    TempoChange,
 )
 from app.core.musicxml import score_to_musicxml
 from app.core.ornaments import collapse_trills, convert_grace_notes
@@ -18,7 +19,7 @@ from app.core.ornaments import collapse_trills, convert_grace_notes
 def _alternating_notes(
     count: int,
     *,
-    spacing: int = 120,
+    spacing: int = 60,
     low: int = 72,
     high: int = 74,
 ) -> list[QuantizedNote]:
@@ -50,7 +51,7 @@ def test_collapse_trills_merges_alternating_edge_line() -> None:
     assert written[0].trill
     assert written[0].pitch == 72
     assert written[0].onset == 0
-    assert written[0].duration == 8 * 120
+    assert written[0].duration == 8 * 60
     assert anchor in collapsed
 
 
@@ -85,14 +86,37 @@ def test_collapse_trills_ignores_wide_intervals() -> None:
 
 
 def test_collapse_trills_ignores_measured_eighth_alternation() -> None:
-    # An eighth-speed two-pitch oscillation is a measured figure, not a
-    # trill; only sixteenth-speed (or faster) alternation earns the mark.
+    # An eighth-speed two-pitch oscillation is a measured figure, not a trill.
     notes = [
         QuantizedNote(index + 1, 72 + (index % 2), index * 240, 240, 80, 0, 0, Staff.RIGHT)
         for index in range(10)
     ]
 
     collapsed, trills, _ = collapse_trills(notes)
+
+    assert trills == 0
+    assert len(collapsed) == len(notes)
+
+
+def test_collapse_trills_ignores_written_sixteenths_even_at_fast_tempo() -> None:
+    notes = _alternating_notes(10, spacing=120)
+
+    collapsed, trills, _ = collapse_trills(
+        notes,
+        tempo_changes=[TempoChange(0, 220.0)],
+    )
+
+    assert trills == 0
+    assert len(collapsed) == len(notes)
+
+
+def test_collapse_trills_uses_real_time_at_slow_tempo() -> None:
+    notes = _alternating_notes(10, spacing=60)
+
+    collapsed, trills, _ = collapse_trills(
+        notes,
+        tempo_changes=[TempoChange(0, 40.0)],
+    )
 
     assert trills == 0
     assert len(collapsed) == len(notes)

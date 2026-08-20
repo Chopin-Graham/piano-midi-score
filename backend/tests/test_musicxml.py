@@ -6,6 +6,7 @@ from xml.etree import ElementTree as ET
 import pytest
 from mido import MidiFile
 
+from app import __version__
 from app.core.engraver import find_musescore
 from app.core.models import (
     ClefChange,
@@ -39,6 +40,26 @@ def _score(notes: list[QuantizedNote], meter: Meter | None = None) -> ScoreModel
         grid_decisions=[],
         measure_count=1,
         measures=[measure],
+    )
+
+
+def test_chord_writes_one_staccato_mark() -> None:
+    notes = [
+        QuantizedNote(1, 60, 0, 240, 80, 0, 0, Staff.RIGHT, staccato=True),
+        QuantizedNote(2, 64, 0, 240, 80, 0, 0, Staff.RIGHT, staccato=True),
+        QuantizedNote(3, 67, 0, 240, 80, 0, 0, Staff.RIGHT, staccato=True),
+    ]
+
+    root = ET.fromstring(score_to_musicxml(_score(notes)))
+
+    assert len(root.findall(".//articulations/staccato")) == 1
+
+
+def test_musicxml_identification_uses_release_version() -> None:
+    root = ET.fromstring(score_to_musicxml(_score([])))
+
+    assert root.findtext(".//identification/encoding/software") == (
+        f"Piano MIDI Score {__version__}"
     )
 
 
