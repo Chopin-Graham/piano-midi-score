@@ -1,6 +1,6 @@
 # Piano MIDI Score
 
-当前版本：`v0.3.1`（版本分级见 [版本与发布规则](docs/versioning.md)，变更记录见 [CHANGELOG](CHANGELOG.md)）。
+当前版本：`v0.3.2`（版本分级见 [版本与发布规则](docs/versioning.md)，变更记录见 [CHANGELOG](CHANGELOG.md)）。
 
 一个本地运行的钢琴 MIDI/音视频转谱程序。MIDI 不会被机械地逐条画到谱面上，而是先完成自适应量化、左右手分配、演奏时值规范化、声部分离和音高拼写，再由 MuseScore Studio 输出 A4 PDF。钢琴录音或演奏视频可先由 Transkun/Basic Pitch 转录为可下载的中间 MIDI，再进入同一套制谱流水线。
 

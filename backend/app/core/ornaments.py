@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import replace
+from itertools import groupby
 from statistics import median
 
 from .models import CANONICAL_DIVISIONS, QuantizedNote, Staff, TempoChange
@@ -49,6 +50,7 @@ _CLEAN_DURATIONS = frozenset(
     }
 )
 MAX_GRACE_DURATION = CANONICAL_DIVISIONS // 4  # a sixteenth note
+MIN_GRACE_VELOCITY_CONTRAST = 6
 
 
 def convert_grace_notes(
@@ -60,9 +62,15 @@ def convert_grace_notes(
     overlaps ordinary short-note timing, so conversion requires converging
     evidence: a single-cell note immediately before a longer, louder on-beat
     note a step or third away, alone at its onset in its voice, off the beat
-    itself.  The grace's time is returned to the previous written note when
-    that restores a clean value (the typical case: the voice simplifier had
-    truncated that note to make room), otherwise a rest absorbs it.
+    itself.  Its melodic context must also look ornamental: a neighbour-note
+    return, a reversal into the target, or a leap followed by stepwise
+    resolution.  A regular scalar run is measured rhythm even when one attack
+    was shifted or shortened by transcription jitter.
+
+    The grace's time is returned to the previous written note only when that
+    restores a clean value.  Requiring a contiguous previous note is
+    deliberately conservative: without that context, a short pickup before a
+    downbeat is indistinguishable from an ordinary written sixteenth.
     """
 
     by_voice: dict[tuple[Staff, int], list[QuantizedNote]] = defaultdict(list)
@@ -77,35 +85,71 @@ def convert_grace_notes(
     result = list(passthrough)
     for voice_notes in by_voice.values():
         ordered = sorted(voice_notes, key=lambda note: (note.onset, note.pitch))
+        columns = [
+            list(column)
+            for _onset, column in groupby(ordered, key=lambda note: note.onset)
+        ]
         converted_ids: set[int] = set()
         extensions: dict[int, int] = {}
-        for index, note in enumerate(ordered[:-1]):
+        for column_index, column in enumerate(columns[:-1]):
+            if len(column) != 1:
+                continue
+            note = column[0]
             if note.source_id in converted_ids or note.trill or note.arpeggiated:
                 continue
             if note.duration > MAX_GRACE_DURATION or note.onset % CANONICAL_DIVISIONS == 0:
                 continue
-            main = ordered[index + 1]
-            if (
-                main.onset != note.end
-                or main.onset % CANONICAL_DIVISIONS != 0
-                or main.trill
-                or main.duration < note.duration * 2
-                or note.velocity >= main.velocity
-            ):
+
+            target_column = columns[column_index + 1]
+            if not target_column or target_column[0].onset != note.end:
                 continue
-            interval = abs(note.pitch - main.pitch)
-            if not 1 <= interval <= 3:
+            if note.end % CANONICAL_DIVISIONS != 0:
                 continue
-            if index and ordered[index - 1].onset == note.onset:
-                continue  # chord member, not a lone grace
-            previous = ordered[index - 1] if index else None
-            if previous is not None and previous.end > note.onset:
+            if any(target.pitch == note.pitch for target in target_column):
+                # A repeated key immediately before the target chord is a
+                # measured re-attack, not an approach ornament to some other
+                # chord tone.
                 continue
-            if previous is not None and previous.end == note.onset:
-                restored = previous.duration + note.duration
-                if restored not in _CLEAN_DURATIONS:
-                    continue
-                extensions[previous.source_id] = restored
+            target_candidates = [
+                target
+                for target in target_column
+                if (
+                    not target.trill
+                    and target.duration >= max(
+                        note.duration * 2,
+                        CANONICAL_DIVISIONS // 2,
+                    )
+                    and target.velocity - note.velocity
+                    >= MIN_GRACE_VELOCITY_CONTRAST
+                    and 1 <= abs(note.pitch - target.pitch) <= 3
+                )
+            ]
+            if not target_candidates:
+                continue
+            main = min(
+                target_candidates,
+                key=lambda target: (
+                    abs(note.pitch - target.pitch),
+                    -target.velocity,
+                    target.pitch,
+                ),
+            )
+
+            if column_index == 0:
+                continue
+            previous_column = columns[column_index - 1]
+            if len(previous_column) != 1:
+                continue
+            previous = previous_column[0]
+            if previous.end != note.onset:
+                continue
+
+            if not _ornamental_approach(previous, note, main):
+                continue
+            restored = previous.duration + note.duration
+            if restored not in _CLEAN_DURATIONS:
+                continue
+            extensions[previous.source_id] = restored
             converted_ids.add(note.source_id)
         for note in ordered:
             if note.source_id in converted_ids:
@@ -120,6 +164,24 @@ def convert_grace_notes(
         sorted(result, key=lambda note: (note.onset, note.pitch, note.source_id)),
         converted,
     )
+
+
+def _ornamental_approach(
+    previous: QuantizedNote,
+    candidate: QuantizedNote,
+    target: QuantizedNote,
+) -> bool:
+    """Whether three melodic anchors support an unmeasured grace note."""
+
+    into_candidate = candidate.pitch - previous.pitch
+    into_target = target.pitch - candidate.pitch
+    if into_candidate == 0 or into_target == 0:
+        return False
+
+    neighbour_return = previous.pitch == target.pitch
+    stepwise_resolution = abs(into_target) <= 2
+    reverses_direction = into_candidate * into_target < 0
+    return neighbour_return or (reverses_direction and stepwise_resolution)
 
 
 def collapse_trills(

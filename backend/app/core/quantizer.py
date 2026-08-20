@@ -92,6 +92,7 @@ def quantize_midi(
     # model timing noise cannot produce that margin because the finer binary
     # grid fits noise at least as well.
     candidate_options = options
+    auto_detected_tuplets = False
     if options.audio_transcription and not options.allow_triplets:
         probe = options.model_copy(update={"allow_triplets": True})
         votes = 0
@@ -112,13 +113,23 @@ def quantize_midi(
                 not in {"thirty_second", "thirty_second_triplet", "sixty_fourth"}
             ]
             binary_error = min(
-                (_grid_timing_error(measure_notes, measure.start, grid.step)
+                (_grid_timing_error(
+                    measure_notes,
+                    measure.start,
+                    grid.step,
+                    onsets_only=True,
+                )
                  for grid in probe_candidates if not grid.triplet),
                 default=None,
             )
             triplet_error = min(
-                (_grid_timing_error(measure_notes, measure.start, grid.step)
-                 for grid in probe_candidates if grid.triplet),
+                (_grid_timing_error(
+                    measure_notes,
+                    measure.start,
+                    grid.step,
+                    onsets_only=True,
+                )
+                 for grid in probe_candidates if "triplet" in grid.name),
                 default=None,
             )
             if binary_error is None or triplet_error is None:
@@ -136,6 +147,7 @@ def quantize_midi(
                 votes += 1
         if total >= 4 and votes / total >= 0.12:
             candidate_options = probe
+            auto_detected_tuplets = True
             warnings.append(
                 f"有 {votes}/{total} 个小节在三连音网格上的拟合显著更优，已自动启用三连音识别"
             )
@@ -145,6 +157,14 @@ def quantize_midi(
 
     for measure_index, measure in enumerate(measures):
         candidates = _grid_candidates(candidate_options, measure.meter)
+        if auto_detected_tuplets:
+            # The global probe only establishes ternary evidence.  It must not
+            # silently unlock quintuplets as well: five-way timing fits are too
+            # easy to manufacture from transcription jitter and need an
+            # explicit user choice instead of piggybacking on triplet votes.
+            candidates = [
+                grid for grid in candidates if "quintuplet" not in grid.name
+            ]
         measure_notes = notes_by_measure.get(measure_index, [])
         if not measure_notes:
             decisions.append(
@@ -178,16 +198,17 @@ def quantize_midi(
                     grid,
                     options.style,
                     fidelity_first=len(bucket_notes) <= 3,
+                    onsets_only=options.audio_transcription,
                 ),
             )
-            if best.triplet and _ratio_evidence(bucket_notes, bucket_start, best.step) < 2:
+            if best.triplet:
                 # A genuine tuplet figure has at least three members (notes or
                 # internal gaps) on the ratio grid.  With less evidence the
                 # choice would only strand isolated members no bracket can
                 # complete — and no importer can print.
                 binary = [grid for grid in bucket_candidates if not grid.triplet]
                 if binary:
-                    best = min(
+                    best_binary = min(
                         binary,
                         key=lambda grid: _grid_cost(
                             bucket_notes,
@@ -195,8 +216,49 @@ def quantize_midi(
                             grid,
                             options.style,
                             fidelity_first=len(bucket_notes) <= 3,
+                            onsets_only=options.audio_transcription,
                         ),
                     )
+                    if auto_detected_tuplets:
+                        distinct_attacks = len(
+                            {note.onset for note in bucket_notes}
+                        )
+                        tuplet_cost = _grid_cost(
+                            bucket_notes,
+                            bucket_start,
+                            best,
+                            options.style,
+                            fidelity_first=len(bucket_notes) <= 3,
+                            onsets_only=options.audio_transcription,
+                        )
+                        binary_cost = _grid_cost(
+                            bucket_notes,
+                            bucket_start,
+                            best_binary,
+                            options.style,
+                            fidelity_first=len(bucket_notes) <= 3,
+                            onsets_only=options.audio_transcription,
+                        )
+                        # Automatic tuplets are deliberately conservative:
+                        # require a complete three-attack figure and a clear
+                        # local advantage over a readable binary grid.  This
+                        # keeps 60/80/96-tick model jitter from alternating
+                        # between 32nds, sextuplets and quintuplets.
+                        if (
+                            distinct_attacks < 3
+                            or tuplet_cost > binary_cost * 0.8
+                        ):
+                            best = best_binary
+                    if (
+                        best.triplet
+                        and _ratio_evidence(
+                            bucket_notes,
+                            bucket_start,
+                            best.step,
+                        )
+                        < 2
+                    ):
+                        best = best_binary
             bucket_grids[bucket_key] = best
 
         finest = min(
@@ -350,8 +412,10 @@ def _grid_cost(
     grid: GridSpec,
     style: str,
     fidelity_first: bool = False,
+    onsets_only: bool = False,
 ) -> float:
-    errors: list[float] = []
+    onset_errors: list[float] = []
+    release_errors: list[float] = []
     collapsed = 0
     tiny_values = 0
     snapped_onsets: list[tuple[tuple[int, int], int, int, int]] = []
@@ -359,15 +423,20 @@ def _grid_cost(
         relative_onset = note.onset - measure_start
         snapped_onset = measure_start + _nearest_multiple(relative_onset, grid.step)
         snapped_end = measure_start + _nearest_multiple(note.end - measure_start, grid.step)
-        errors.append(abs(snapped_onset - note.onset) / (CANONICAL_DIVISIONS / 4))
-        errors.append(abs(snapped_end - note.end) / (CANONICAL_DIVISIONS / 4))
+        onset_errors.append(
+            abs(snapped_onset - note.onset) / (CANONICAL_DIVISIONS / 4)
+        )
+        release_errors.append(
+            abs(snapped_end - note.end) / (CANONICAL_DIVISIONS / 4)
+        )
         if snapped_end <= snapped_onset:
             collapsed += 1
         if snapped_end - snapped_onset <= grid.step:
             tiny_values += 1
         snapped_onsets.append(((note.track, note.channel), note.pitch, note.onset, snapped_onset))
 
-    timing_error = fmean(errors) if errors else 0.0
+    timing_errors = onset_errors if onsets_only else [*onset_errors, *release_errors]
+    timing_error = fmean(timing_errors) if timing_errors else 0.0
     merge_penalty = _false_chord_merges(snapped_onsets) * 1.0 / len(notes)
     if fidelity_first:
         # Sparse buckets (a sustained chord, a lone entrance) are readable on
@@ -375,11 +444,15 @@ def _grid_cost(
         # that mistimes the attack.  Compare onset fidelity only — releases
         # get normalized by the grid anyway, and counting them would let an
         # ultra-fine binary grid outrank a genuinely exact triplet grid.
-        onset_errors = errors[0::2]
-        return (fmean(onset_errors) if onset_errors else 0.0) + merge_penalty
-    collapse_penalty = collapsed * 1.25 / len(notes)
+        ratio_penalty = grid.complexity if grid.triplet else 0.0
+        return (
+            (fmean(onset_errors) if onset_errors else 0.0)
+            + merge_penalty
+            + ratio_penalty
+        )
+    collapse_penalty = 0.0 if onsets_only else collapsed * 1.25 / len(notes)
     tiny_factor = {"clean": 0.05, "balanced": 0.02, "faithful": 0.0}[style]
-    tiny_penalty = tiny_values * tiny_factor / len(notes)
+    tiny_penalty = 0.0 if onsets_only else tiny_values * tiny_factor / len(notes)
     return timing_error + grid.complexity + collapse_penalty + tiny_penalty + merge_penalty
 
 
@@ -412,13 +485,16 @@ def _grid_timing_error(
     notes: list[QuantizedNote],
     measure_start: int,
     step: int,
+    *,
+    onsets_only: bool = False,
 ) -> float:
     errors: list[float] = []
     for note in notes:
         snapped_onset = measure_start + _nearest_multiple(note.onset - measure_start, step)
         snapped_end = measure_start + _nearest_multiple(note.end - measure_start, step)
         errors.append(abs(snapped_onset - note.onset) / (CANONICAL_DIVISIONS / 4))
-        errors.append(abs(snapped_end - note.end) / (CANONICAL_DIVISIONS / 4))
+        if not onsets_only:
+            errors.append(abs(snapped_end - note.end) / (CANONICAL_DIVISIONS / 4))
     return fmean(errors) if errors else 0.0
 
 

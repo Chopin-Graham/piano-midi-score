@@ -152,7 +152,7 @@ def test_trill_note_writes_ornament_and_keeps_voice_time() -> None:
 
 def _grace_scenario() -> list[QuantizedNote]:
     return [
-        QuantizedNote(1, 72, 0, 360, 80, 0, 0, Staff.RIGHT, voice=1),
+        QuantizedNote(1, 76, 0, 360, 80, 0, 0, Staff.RIGHT, voice=1),
         QuantizedNote(2, 74, 360, 120, 70, 0, 0, Staff.RIGHT, voice=1),
         QuantizedNote(3, 76, 480, 480, 90, 0, 0, Staff.RIGHT, voice=1),
     ]
@@ -180,7 +180,45 @@ def test_grace_note_requires_stepwise_quieter_approach() -> None:
     assert count == 0
 
 
-def test_grace_note_absorbed_by_rest_when_voice_has_a_gap() -> None:
+def test_grace_note_rejects_regular_scalar_run() -> None:
+    notes = [
+        QuantizedNote(1, 72, 0, 360, 80, 0, 0, Staff.RIGHT, voice=1),
+        QuantizedNote(2, 74, 360, 120, 70, 0, 0, Staff.RIGHT, voice=1),
+        QuantizedNote(3, 76, 480, 480, 90, 0, 0, Staff.RIGHT, voice=1),
+    ]
+
+    converted, count = convert_grace_notes(notes)
+
+    assert count == 0
+    assert all(not note.grace for note in converted)
+
+
+def test_grace_note_rejects_same_direction_leap_into_target() -> None:
+    notes = [
+        QuantizedNote(1, 80, 0, 360, 80, 0, 0, Staff.RIGHT, voice=1),
+        QuantizedNote(2, 76, 360, 120, 70, 0, 0, Staff.RIGHT, voice=1),
+        QuantizedNote(3, 74, 480, 480, 90, 0, 0, Staff.RIGHT, voice=1),
+    ]
+
+    _, count = convert_grace_notes(notes)
+
+    assert count == 0
+
+
+def test_grace_note_rejects_repeated_pitch_before_target_chord() -> None:
+    notes = [
+        QuantizedNote(1, 80, 0, 360, 80, 0, 0, Staff.RIGHT, voice=1),
+        QuantizedNote(2, 76, 360, 120, 70, 0, 0, Staff.RIGHT, voice=1),
+        QuantizedNote(3, 74, 480, 480, 90, 0, 0, Staff.RIGHT, voice=1),
+        QuantizedNote(4, 76, 480, 480, 92, 0, 0, Staff.RIGHT, voice=1),
+    ]
+
+    _, count = convert_grace_notes(notes)
+
+    assert count == 0
+
+
+def test_grace_note_requires_previous_melodic_context() -> None:
     notes = [
         QuantizedNote(1, 74, 1800, 120, 70, 0, 0, Staff.RIGHT, voice=1),
         QuantizedNote(2, 76, 1920, 480, 92, 0, 0, Staff.RIGHT, voice=1),
@@ -188,8 +226,21 @@ def test_grace_note_absorbed_by_rest_when_voice_has_a_gap() -> None:
 
     converted, count = convert_grace_notes(notes)
 
+    assert count == 0
+    assert not next(note for note in converted if note.source_id == 1).grace
+
+
+def test_grace_note_accepts_leap_then_stepwise_resolution() -> None:
+    notes = [
+        QuantizedNote(1, 67, 0, 360, 80, 0, 0, Staff.RIGHT, voice=1),
+        QuantizedNote(2, 74, 360, 120, 70, 0, 0, Staff.RIGHT, voice=1),
+        QuantizedNote(3, 72, 480, 480, 90, 0, 0, Staff.RIGHT, voice=1),
+    ]
+
+    converted, count = convert_grace_notes(notes)
+
     assert count == 1
-    assert next(note for note in converted if note.source_id == 1).grace
+    assert next(note for note in converted if note.source_id == 2).grace
 
 
 def test_grace_note_writes_slashed_note_without_duration() -> None:

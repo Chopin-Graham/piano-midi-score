@@ -145,6 +145,105 @@ def test_audio_auto_keeps_binary_grid_for_noisy_binary_content() -> None:
     assert all(not decision.triplet for decision in decisions)
 
 
+def test_audio_triplet_probe_does_not_unlock_quintuplet_grids() -> None:
+    notes: list[RawNote] = []
+    for measure in range(5):
+        base = measure * 1920
+        for beat in range(4):
+            for member in range(3):
+                onset = base + beat * 480 + member * 160
+                notes.append(
+                    RawNote(len(notes), 60 + member, onset, onset + 140, 80, 0, 0)
+                )
+
+    quintuplet_measure = 5 * 1920
+    for beat in range(4):
+        for member in range(5):
+            onset = quintuplet_measure + beat * 480 + member * 96
+            notes.append(
+                RawNote(len(notes), 67 + member, onset, onset + 86, 80, 0, 0)
+            )
+
+    _, decisions, _, warnings = quantize_midi(
+        _audio_parsed(notes),
+        Meter(4, 4),
+        ConversionOptions(
+            style="clean",
+            audio_transcription=True,
+            allow_triplets=False,
+        ),
+    )
+
+    assert any("自动启用三连音" in warning for warning in warnings)
+    assert all("quintuplet" not in decision.name for decision in decisions)
+
+
+def test_audio_auto_rejects_weak_sextuplet_fit_in_favor_of_binary_grid() -> None:
+    notes: list[RawNote] = []
+    for measure in range(5):
+        base = measure * 1920
+        for beat in range(4):
+            for member in range(3):
+                onset = base + beat * 480 + member * 160
+                notes.append(
+                    RawNote(len(notes), 60 + member, onset, onset + 140, 80, 0, 0)
+                )
+
+    noisy_measure = 5 * 1920
+    for member, offset in enumerate((8, 82, 145, 282, 346, 396)):
+        onset = noisy_measure + offset
+        notes.append(
+            RawNote(len(notes), 72 + member, onset, onset + 67, 80, 0, 0)
+        )
+
+    quantized, decisions, _, _ = quantize_midi(
+        _audio_parsed(notes),
+        Meter(4, 4),
+        ConversionOptions(
+            style="clean",
+            audio_transcription=True,
+            allow_triplets=False,
+        ),
+    )
+
+    assert decisions[5].triplet is False
+    target = [note for note in quantized if note.onset >= noisy_measure]
+    assert target
+    assert all(note.onset % 60 == 0 for note in target)
+
+
+def test_audio_auto_does_not_complete_sparse_tuplet_with_rests() -> None:
+    notes: list[RawNote] = []
+    for measure in range(5):
+        base = measure * 1920
+        for beat in range(4):
+            for member in range(3):
+                onset = base + beat * 480 + member * 160
+                notes.append(
+                    RawNote(len(notes), 60 + member, onset, onset + 140, 80, 0, 0)
+                )
+
+    sparse_measure = 5 * 1920
+    for member, offset in enumerate((0, 160)):
+        onset = sparse_measure + offset
+        notes.append(
+            RawNote(len(notes), 72 + member, onset, onset + 140, 80, 0, 0)
+        )
+
+    _, decisions, _, warnings = quantize_midi(
+        _audio_parsed(notes),
+        Meter(4, 4),
+        ConversionOptions(
+            style="clean",
+            audio_transcription=True,
+            allow_triplets=False,
+        ),
+    )
+
+    assert any("自动启用三连音" in warning for warning in warnings)
+    assert decisions[5].triplet is False
+
+
 def test_per_lane_per_beat_grids_keep_quintuplet_run_exact() -> None:
     # Track 0 plays a five-per-beat run (96-tick spacing) while track 1 holds
     # a steady dotted-eighth pattern.  A measure-wide grid would crush one of
