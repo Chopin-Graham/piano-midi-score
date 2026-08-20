@@ -300,3 +300,50 @@ def test_attack_column_window_preserves_fast_thirty_seconds() -> None:
 
     assert analysis["attack_columns_after"] >= 16
     assert analysis["attack_columns_after"] < analysis["attack_columns_before"]
+
+
+def test_ioi_timeline_recovers_slow_opening_and_theme_tempo() -> None:
+    from app.core.media_transcription import (
+        _has_sustained_tempo_variation,
+        _ioi_timeline_mapper,
+    )
+
+    # Opening: slow sixteenth-motion (~68 BPM), then a faster 16th theme.
+    notes: list[_TimedNote] = []
+    t = 0.0
+    for step in range(16):
+        notes.append(_TimedNote(60 + (step % 8), t, t + 0.18, 70))
+        t += 0.22  # sixteenths at 68 BPM
+    for index in range(60):
+        notes.append(_TimedNote(60 + (index % 8), t, t + 0.2, 70))
+        t += 0.116  # sixteenths at 129 BPM
+
+    mapper, tempo = _ioi_timeline_mapper(notes, 120.0)
+    attacks = sorted(note.start for note in notes)
+
+    opening_bps = mapper(attacks[1]) / max(attacks[1], 1e-6)
+    theme_bps = (mapper(attacks[-1]) - mapper(attacks[20])) / (attacks[-1] - attacks[20])
+    opening_bpm = opening_bps * 60
+    theme_bpm = theme_bps * 60
+
+    assert 45.0 < opening_bpm < 95.0
+    assert 110.0 < theme_bpm < 160.0
+    assert _has_sustained_tempo_variation(mapper, attacks)
+
+
+def test_ioi_timeline_stays_quiet_for_steady_performance() -> None:
+    from app.core.media_transcription import (
+        _has_sustained_tempo_variation,
+        _ioi_timeline_mapper,
+    )
+
+    notes: list[_TimedNote] = []
+    t = 0.0
+    for index in range(80):
+        notes.append(_TimedNote(60 + (index % 8), t, t + 0.2, 70))
+        t += 0.116  # steady sixteenths
+
+    mapper, _ = _ioi_timeline_mapper(notes, 120.0)
+    attacks = sorted(note.start for note in notes)
+
+    assert not _has_sustained_tempo_variation(mapper, attacks)
