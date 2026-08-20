@@ -319,6 +319,40 @@ def test_estimate_meter_detects_three_four() -> None:
     assert (numerator, denominator) == (3, 4)
 
 
+def test_estimate_meter_keeps_waltz_when_bass_moves_on_every_beat() -> None:
+    notes: list[_TimedNote] = []
+    for measure in range(24):
+        base = measure * 3.0
+        for beat, (bass_pitch, velocity, duration) in enumerate(
+            ((36, 100, 1.55), (43, 76, 0.75), (47, 78, 0.75))
+        ):
+            onset = base + beat
+            notes.append(
+                _TimedNote(
+                    bass_pitch,
+                    onset,
+                    onset + duration,
+                    velocity,
+                )
+            )
+            for pitch in (60 + beat, 64 + beat, 67 + beat):
+                notes.append(
+                    _TimedNote(
+                        pitch,
+                        onset,
+                        onset + 0.42,
+                        78 if beat == 0 else 68,
+                    )
+                )
+
+    numerator, denominator, phase = _estimate_meter_and_downbeat(
+        notes,
+        lambda value: value,
+    )
+
+    assert (numerator, denominator, phase) == (3, 4, 0.0)
+
+
 def test_estimate_meter_keeps_four_four_for_common_time() -> None:
     notes = _accented_pattern(12, 4)
 

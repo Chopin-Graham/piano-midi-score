@@ -1246,16 +1246,21 @@ def _estimate_meter_and_downbeat(
         best4 = opposite4
         resolved_half_bar_ambiguity = True
 
-    if (
-        scores[best3] > scores[best4] + margin
-        and scores[best3] > scores[best2] + margin
-    ):
-        numerator, phase = 3, best3[1]
-    elif (
+    # A two-beat hypothesis places a candidate barline twice as often as 4/4
+    # and 50% more often than 3/4, so its raw accumulated accent score is not
+    # directly comparable with the other meter families.  It is meaningful
+    # only together with ternary subdivision evidence, where it represents the
+    # two dotted-quarter pulses of 6/8.  Letting that denser sampling veto 3/4
+    # made waltzes with a bass note on every beat fall through to the default
+    # 4/4 even when the three-beat accent cycle was otherwise unambiguous.
+    compound_two_beat = (
         scores[best2] > scores[best4] + margin
         and _ternary_subdivision_dominant(notes, mapper, best2[1])
-    ):
+    )
+    if compound_two_beat:
         return 6, 8, float(best2[1])
+    if scores[best3] > scores[best4] + margin:
+        numerator, phase = 3, best3[1]
     elif resolved_half_bar_ambiguity or scores[best4] > scores[(4, 0)] + margin:
         numerator, phase = 4, best4[1]
     else:
