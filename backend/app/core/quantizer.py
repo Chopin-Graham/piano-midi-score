@@ -17,6 +17,9 @@ from .models import (
 from .options import ConversionOptions
 from .piano_rules import MAX_HAND_SPAN_SEMITONES, MAX_SIMULTANEOUS_KEYS_PER_HAND
 
+AUTO_TRIPLET_MEASURE_SHARE = 0.05
+AUTO_TUPLET_FIT_RATIO = 0.8
+
 
 @dataclass(frozen=True, slots=True)
 class GridSpec:
@@ -145,7 +148,7 @@ def quantize_midi(
             )
             if has_middle_tatum and triplet_error < binary_error * 0.6:
                 votes += 1
-        if total >= 4 and votes / total >= 0.12:
+        if total >= 4 and votes / total >= AUTO_TRIPLET_MEASURE_SHARE:
             candidate_options = probe
             auto_detected_tuplets = True
             warnings.append(
@@ -168,7 +171,13 @@ def quantize_midi(
         measure_notes = notes_by_measure.get(measure_index, [])
         if not measure_notes:
             decisions.append(
-                GridDecision(measure_index, candidates[0].name, candidates[0].step, 0.0)
+                GridDecision(
+                    measure_index,
+                    candidates[0].name,
+                    candidates[0].step,
+                    0.0,
+                    auto_tuplet=auto_detected_tuplets,
+                )
             )
             continue
 
@@ -201,7 +210,81 @@ def quantize_midi(
                     onsets_only=options.audio_transcription,
                 ),
             )
-            if best.triplet:
+            if auto_detected_tuplets:
+                binary = [grid for grid in bucket_candidates if not grid.triplet]
+                tuplets = [grid for grid in bucket_candidates if grid.triplet]
+                if binary:
+                    best_binary = min(
+                        binary,
+                        key=lambda grid: _grid_cost(
+                            bucket_notes,
+                            bucket_start,
+                            grid,
+                            options.style,
+                            fidelity_first=len(bucket_notes) <= 3,
+                            onsets_only=options.audio_transcription,
+                        ),
+                    )
+                    best = best_binary
+                    if tuplets:
+                        # Compare the observed timing fit separately from the
+                        # readability prior.  The complexity term should break
+                        # close calls, not turn a clearly ternary 80/160-tick
+                        # run into syncopated binary notes merely because a
+                        # triplet symbol costs ink.
+                        best_tuplet = min(
+                            tuplets,
+                            key=lambda grid: (
+                                _grid_cost(
+                                    bucket_notes,
+                                    bucket_start,
+                                    grid,
+                                    options.style,
+                                    fidelity_first=len(bucket_notes) <= 3,
+                                    onsets_only=options.audio_transcription,
+                                )
+                                - grid.complexity,
+                                _grid_cost(
+                                    bucket_notes,
+                                    bucket_start,
+                                    grid,
+                                    options.style,
+                                    fidelity_first=len(bucket_notes) <= 3,
+                                    onsets_only=options.audio_transcription,
+                                ),
+                            ),
+                        )
+                        tuplet_cost = _grid_cost(
+                            bucket_notes,
+                            bucket_start,
+                            best_tuplet,
+                            options.style,
+                            fidelity_first=len(bucket_notes) <= 3,
+                            onsets_only=options.audio_transcription,
+                        )
+                        binary_cost = _grid_cost(
+                            bucket_notes,
+                            bucket_start,
+                            best_binary,
+                            options.style,
+                            fidelity_first=len(bucket_notes) <= 3,
+                            onsets_only=options.audio_transcription,
+                        )
+                        tuplet_fit = max(0.0, tuplet_cost - best_tuplet.complexity)
+                        binary_fit = max(0.0, binary_cost - best_binary.complexity)
+                        distinct_attacks = len({note.onset for note in bucket_notes})
+                        if (
+                            distinct_attacks >= 3
+                            and _ratio_evidence(
+                                bucket_notes,
+                                bucket_start,
+                                best_tuplet.step,
+                            )
+                            >= 2
+                            and tuplet_fit <= binary_fit * AUTO_TUPLET_FIT_RATIO
+                        ):
+                            best = best_tuplet
+            elif best.triplet:
                 # A genuine tuplet figure has at least three members (notes or
                 # internal gaps) on the ratio grid.  With less evidence the
                 # choice would only strand isolated members no bracket can
@@ -219,36 +302,6 @@ def quantize_midi(
                             onsets_only=options.audio_transcription,
                         ),
                     )
-                    if auto_detected_tuplets:
-                        distinct_attacks = len(
-                            {note.onset for note in bucket_notes}
-                        )
-                        tuplet_cost = _grid_cost(
-                            bucket_notes,
-                            bucket_start,
-                            best,
-                            options.style,
-                            fidelity_first=len(bucket_notes) <= 3,
-                            onsets_only=options.audio_transcription,
-                        )
-                        binary_cost = _grid_cost(
-                            bucket_notes,
-                            bucket_start,
-                            best_binary,
-                            options.style,
-                            fidelity_first=len(bucket_notes) <= 3,
-                            onsets_only=options.audio_transcription,
-                        )
-                        # Automatic tuplets are deliberately conservative:
-                        # require a complete three-attack figure and a clear
-                        # local advantage over a readable binary grid.  This
-                        # keeps 60/80/96-tick model jitter from alternating
-                        # between 32nds, sextuplets and quintuplets.
-                        if (
-                            distinct_attacks < 3
-                            or tuplet_cost > binary_cost * 0.8
-                        ):
-                            best = best_binary
                     if (
                         best.triplet
                         and _ratio_evidence(
@@ -266,13 +319,20 @@ def quantize_midi(
             key=lambda grid: grid.step,
             default=candidates[0],
         )
+        uses_tuplet_grid = any(grid.triplet for grid in bucket_grids.values())
         decisions.append(
             GridDecision(
                 measure_index=measure_index,
                 name=finest.name,
                 step=finest.step,
                 score=0.0,
-                triplet=any(grid.triplet for grid in bucket_grids.values()),
+                triplet=uses_tuplet_grid,
+                # Once audio has enabled the automatic ternary probe, every
+                # ratio-looking group in the score is speculative — even a
+                # nominally binary measure can acquire 80/160-tick fragments
+                # during release cleanup.  Mark the whole decision timeline
+                # so MusicXML hides groups without real attack support.
+                auto_tuplet=auto_detected_tuplets,
             )
         )
 

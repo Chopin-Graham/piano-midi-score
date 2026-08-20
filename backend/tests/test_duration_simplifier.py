@@ -188,6 +188,52 @@ def test_audio_transcription_extends_short_chord_to_quarter_note_cell() -> None:
     assert analysis["transcription_release_extended_note_count"] == 2
 
 
+def test_audio_transcription_keeps_coherent_octave_one_written_duration() -> None:
+    meter = Meter(4, 4)
+    measures = [MeasureSpan(0, 0, meter.measure_length, meter)]
+    notes = [
+        QuantizedNote(1, 60, 0, 120, 82, 0, 0, Staff.RIGHT),
+        QuantizedNote(2, 72, 0, 120, 86, 0, 0, Staff.RIGHT),
+        QuantizedNote(3, 55, 240, 240, 72, 0, 0, Staff.RIGHT),
+        QuantizedNote(4, 74, 480, 240, 88, 0, 0, Staff.RIGHT),
+    ]
+
+    transcribed, analysis, _ = simplify_polyphonic_durations(
+        notes,
+        max_voices=2,
+        style="clean",
+        measures=measures,
+        transcription_mode=True,
+    )
+
+    by_id = {note.source_id: note for note in transcribed}
+    assert by_id[1].duration == by_id[2].duration
+    assert analysis["coherent_attack_duration_repair_count"] >= 1
+
+
+def test_audio_transcription_preserves_independent_chord_tone_gates() -> None:
+    meter = Meter(4, 4)
+    measures = [MeasureSpan(0, 0, meter.measure_length, meter)]
+    notes = [
+        QuantizedNote(1, 60, 0, 120, 76, 0, 0, Staff.RIGHT),
+        QuantizedNote(2, 64, 0, 360, 78, 0, 0, Staff.RIGHT),
+        QuantizedNote(3, 72, 0, 120, 84, 0, 0, Staff.RIGHT),
+        QuantizedNote(4, 74, 480, 240, 86, 0, 0, Staff.RIGHT),
+    ]
+
+    transcribed, analysis, _ = simplify_polyphonic_durations(
+        notes,
+        max_voices=2,
+        style="clean",
+        measures=measures,
+        transcription_mode=True,
+    )
+
+    by_id = {note.source_id: note for note in transcribed}
+    assert by_id[2].duration != by_id[1].duration
+    assert analysis["coherent_attack_duration_repair_count"] == 0
+
+
 def test_audio_transcription_normalizes_repeated_eighth_accompaniment() -> None:
     meter = Meter(4, 4)
     measures = [MeasureSpan(0, 0, meter.measure_length, meter)]

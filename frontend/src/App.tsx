@@ -49,6 +49,39 @@ const DEFAULT_TRANSCRIPTION_OPTIONS: TranscriptionOptions = {
   frame_threshold: 0.3,
 };
 
+const SCORE_STYLE_GUIDANCE: Record<ScoreStyle, { title: string; detail: string }> = {
+  clean: {
+    title: "推荐 · 简洁",
+    detail: "优先消除转录抖动、碎休止与多余声部，最适合音频、视频和直接打印。",
+  },
+  balanced: {
+    title: "均衡",
+    detail: "保留更多演奏细节，同时做适度节奏整理，适合质量较好的 MIDI。",
+  },
+  faithful: {
+    title: "忠实",
+    detail: "尽量保留原始时值与声部，便于专业复核，但谱面可能更密、更碎。",
+  },
+};
+
+const ENGRAVING_STYLE_GUIDANCE: Record<
+  EngravingStyle,
+  { title: string; detail: string }
+> = {
+  classic: {
+    title: "推荐 · 经典出版",
+    detail: "标准字号与留白，打印和屏幕阅读都稳定，适合大多数钢琴谱。",
+  },
+  modern: {
+    title: "现代清晰",
+    detail: "符号更醒目、间距略宽，适合屏幕阅读或初学者查看。",
+  },
+  compact: {
+    title: "紧凑演奏",
+    detail: "缩小字号和间距以减少页数，适合长曲；复杂多声部可能显得拥挤。",
+  },
+};
+
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
   const [options, setOptions] = useState<ConversionOptions>(DEFAULT_OPTIONS);
@@ -349,7 +382,7 @@ export default function App() {
           <section>
             <div className="section-heading">
               <span>{isMedia || isPdf ? "04" : "03"}</span>
-              <div><h2>谱面风格</h2><p>先追求清楚，再追求细节</p></div>
+              <div><h2>记谱与版面风格</h2><p>记谱决定如何整理节奏，雕版只改变视觉排版</p></div>
             </div>
             <div className="segmented" role="group" aria-label="谱面风格">
               {(["clean", "balanced", "faithful"] as ScoreStyle[]).map((style) => (
@@ -363,6 +396,10 @@ export default function App() {
                 </button>
               ))}
             </div>
+            <div className="style-explanation" aria-live="polite">
+              <strong>{SCORE_STYLE_GUIDANCE[options.style].title}</strong>
+              <span>{SCORE_STYLE_GUIDANCE[options.style].detail}</span>
+            </div>
 
             <label className="field">
               <span>雕版字体与间距</span>
@@ -375,11 +412,18 @@ export default function App() {
                   })
                 }
               >
-                <option value="classic">经典出版 · Leland / Edwin</option>
+                <option value="classic">经典出版（推荐）· Leland / Edwin</option>
                 <option value="modern">现代清晰 · Bravura / Edwin</option>
                 <option value="compact">紧凑演奏 · Leland / Edwin</option>
               </select>
             </label>
+            <div className="style-explanation engraving-explanation" aria-live="polite">
+              <strong>{ENGRAVING_STYLE_GUIDANCE[options.engraving_style].title}</strong>
+              <span>{ENGRAVING_STYLE_GUIDANCE[options.engraving_style].detail}</span>
+            </div>
+            <p className="style-recommendation">
+              一般推荐“简洁 + 经典出版”；它不会隐藏音头，只会减少转录噪声并保持舒展排版。
+            </p>
 
             <label className="field">
               <span>最小时值</span>

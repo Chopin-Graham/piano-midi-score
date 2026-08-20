@@ -10,6 +10,7 @@ from app import __version__
 from app.core.engraver import find_musescore
 from app.core.models import (
     ClefChange,
+    GridDecision,
     Hand,
     KeyChange,
     KeyEstimate,
@@ -839,6 +840,53 @@ def test_triplet_rests_stay_inside_tuplet_brackets() -> None:
     assert first_member.find("notations/tuplet[@type='start']") is not None
 
     assert musicxml_readability_metrics(musicxml)["unbalanced_tuplet_brackets"] == 0
+
+
+def test_auto_tuplet_hides_two_note_padding_group() -> None:
+    notes = [
+        QuantizedNote(1, 60, 0, 160, 80, 0, 0, Staff.RIGHT),
+        QuantizedNote(2, 64, 160, 160, 80, 0, 0, Staff.RIGHT),
+    ]
+    score = _score(notes)
+    score.grid_decisions = [
+        GridDecision(0, "eighth_triplet", 160, 0.0, True, True)
+    ]
+
+    musicxml = score_to_musicxml(score)
+    root = ET.fromstring(musicxml)
+
+    starts = root.findall(".//notations/tuplet[@type='start']")
+    assert len(starts) == 1
+    assert starts[0].get("bracket") == "no"
+    assert starts[0].get("show-number") == "none"
+    assert all(
+        note.get("print-object") == "no"
+        for note in root.findall(".//note")
+        if note.find("rest") is not None and note.find("time-modification") is not None
+    )
+    metrics = musicxml_readability_metrics(musicxml)
+    assert metrics["visible_tuplet_spans"] == 0
+    assert metrics["hidden_tuplet_spans"] == 1
+    assert metrics["unbalanced_tuplet_brackets"] == 0
+
+
+def test_auto_tuplet_brackets_three_real_attacks() -> None:
+    notes = [
+        QuantizedNote(index + 1, 60 + index, index * 160, 160, 80, 0, 0, Staff.RIGHT)
+        for index in range(3)
+    ]
+    score = _score(notes)
+    score.grid_decisions = [
+        GridDecision(0, "eighth_triplet", 160, 0.0, True, True)
+    ]
+
+    musicxml = score_to_musicxml(score)
+    root = ET.fromstring(musicxml)
+
+    assert len(root.findall(".//notations/tuplet[@type='start']")) == 1
+    assert len(root.findall(".//notations/tuplet[@type='stop']")) == 1
+    assert len(root.findall(".//time-modification")) == 3
+    assert root.find(".//notations/tuplet[@type='start']").get("bracket") == "auto"
 
 
 def test_compound_meter_eighths_are_not_rebranded_as_triplets() -> None:

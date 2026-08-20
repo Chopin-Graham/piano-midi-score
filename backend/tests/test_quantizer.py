@@ -145,6 +145,41 @@ def test_audio_auto_keeps_binary_grid_for_noisy_binary_content() -> None:
     assert all(not decision.triplet for decision in decisions)
 
 
+def test_audio_auto_recovers_short_genuine_triplet_section() -> None:
+    notes: list[RawNote] = []
+    for measure in range(19):
+        base = measure * 1920
+        for beat in range(4):
+            for member in range(4):
+                onset = base + beat * 480 + member * 120
+                notes.append(
+                    RawNote(len(notes), 60 + member, onset, onset + 100, 80, 0, 0)
+                )
+
+    triplet_measure = 19 * 1920
+    for beat in range(4):
+        for member in range(3):
+            onset = triplet_measure + beat * 480 + member * 160
+            notes.append(
+                RawNote(len(notes), 72 + member, onset, onset + 140, 80, 0, 0)
+            )
+
+    _, decisions, _, warnings = quantize_midi(
+        _audio_parsed(notes),
+        Meter(4, 4),
+        ConversionOptions(
+            style="clean",
+            audio_transcription=True,
+            allow_triplets=False,
+        ),
+    )
+
+    assert any("自动启用三连音" in warning for warning in warnings)
+    assert decisions[19].triplet is True
+    assert all(not decision.triplet for decision in decisions[:19])
+    assert all(decision.auto_tuplet for decision in decisions)
+
+
 def test_audio_triplet_probe_does_not_unlock_quintuplet_grids() -> None:
     notes: list[RawNote] = []
     for measure in range(5):

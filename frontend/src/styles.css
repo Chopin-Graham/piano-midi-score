@@ -63,6 +63,11 @@ button:disabled { cursor: not-allowed; opacity: 0.48; }
 .segmented { display: grid; grid-template-columns: repeat(3, 1fr); padding: 3px; border-radius: 9px; background: #e9e6df; margin-bottom: 15px; }
 .segmented button { border: 0; padding: 8px 4px; border-radius: 7px; color: #6b675f; background: transparent; font-size: 12px; }
 .segmented button.active { color: var(--ink); background: white; box-shadow: 0 1px 4px rgba(42, 38, 31, .12); }
+.style-explanation { display: grid; gap: 3px; margin: -7px 0 13px; padding: 9px 10px; border: 1px solid #d6ded8; border-radius: 8px; color: #53675d; background: #f1f6f3; font-size: 10px; line-height: 1.5; }
+.style-explanation strong { color: var(--accent); font-size: 11px; }
+.engraving-explanation { margin-top: -6px; border-color: #ded8cd; color: #6b6257; background: #f7f4ed; }
+.engraving-explanation strong { color: #8b653f; }
+.style-recommendation { margin: 8px 1px 14px; color: #817b71; font-size: 10px; line-height: 1.5; }
 .field { display: grid; gap: 6px; margin: 13px 0; color: #5f5b54; font-size: 12px; }
 .field select, .field input[type="text"] { width: 100%; border: 1px solid #d3cec4; border-radius: 8px; padding: 9px 10px; color: var(--ink); background: white; outline: none; }
 .field select:focus, .field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(49, 92, 75, .09); }

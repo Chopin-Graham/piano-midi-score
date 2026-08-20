@@ -969,6 +969,7 @@ def _estimate_meter_and_downbeat(
 
     total_weight = 0.0
     scores: dict[tuple[int, float], float] = {}
+    opening_weight = 0.0
     # Beat trackers can lock onto a sixteenth off-beat: every onset then sits
     # a sub-beat fraction off the true quarter grid, and integer-beat phase
     # hypotheses can never pull it back.  Search downbeats at sixteenth
@@ -981,6 +982,9 @@ def _estimate_meter_and_downbeat(
     )
     for hypothesis in hypotheses:
         scores[hypothesis] = 0.0
+    opening_scores = dict.fromkeys(hypotheses, 0.0)
+    first_onset = min(columns)
+    opening_end = first_onset + 64.0
     for onset, column in columns.items():
         # One column, one vote: taking the loudest attack instead of summing
         # the column keeps a dense off-beat chord from outvoting the bass.
@@ -988,16 +992,22 @@ def _estimate_meter_and_downbeat(
         lowest = min(note.pitch for note in column)
         longest = max(mapper(note.end) - mapper(note.start) for note in column)
         total_weight += weight
+        in_opening = onset < opening_end
+        if in_opening:
+            opening_weight += weight
         is_bass = lowest <= 45
         is_long = longest >= 1.5
         for meter, phase in hypotheses:
             position = (onset - phase) % meter
             if min(position, meter - position) < 0.13:
-                scores[(meter, phase)] += weight
+                accent = weight
                 if is_bass:
-                    scores[(meter, phase)] += 0.5 * weight
+                    accent += 0.5 * weight
                 if is_long:
-                    scores[(meter, phase)] += 0.5 * weight
+                    accent += 0.5 * weight
+                scores[(meter, phase)] += accent
+                if in_opening:
+                    opening_scores[(meter, phase)] += accent
 
     reference = max(total_weight, 1.0)
     margin = 0.06 * reference
@@ -1012,6 +1022,29 @@ def _estimate_meter_and_downbeat(
     best3 = family_winner(3)
     best2 = family_winner(2)
 
+    # In 4/4, beat three often carries the lowest/longest bass note and can
+    # narrowly outscore the real downbeat.  That is a half-bar ambiguity, not
+    # reliable evidence for a three-beat pickup.  When the two opposite phase
+    # candidates are globally close, let the opening phrase decide — but only
+    # when it clearly supports the opposite phase and produces a materially
+    # shorter pickup.  This preserves genuine strong phase shifts while fixing
+    # arrangements whose beat-three accompaniment is heavier than beat one.
+    opposite4 = (4, (best4[1] + 2.0) % 4.0)
+    resolved_half_bar_ambiguity = False
+
+    def pickup_length(phase: float) -> float:
+        length = (phase - first_onset) % 4.0
+        return 0.0 if min(length, 4.0 - length) < 0.13 else length
+
+    if (
+        scores[best4] - scores[opposite4] <= 0.02 * reference
+        and opening_scores[opposite4] - opening_scores[best4]
+        >= 0.035 * max(opening_weight, 1.0)
+        and pickup_length(opposite4[1]) + 0.5 < pickup_length(best4[1])
+    ):
+        best4 = opposite4
+        resolved_half_bar_ambiguity = True
+
     if (
         scores[best3] > scores[best4] + margin
         and scores[best3] > scores[best2] + margin
@@ -1022,7 +1055,7 @@ def _estimate_meter_and_downbeat(
         and _ternary_subdivision_dominant(notes, mapper, best2[1])
     ):
         return 6, 8, float(best2[1])
-    elif scores[best4] > scores[(4, 0)] + margin:
+    elif resolved_half_bar_ambiguity or scores[best4] > scores[(4, 0)] + margin:
         numerator, phase = 4, best4[1]
     else:
         numerator, phase = 4, 0

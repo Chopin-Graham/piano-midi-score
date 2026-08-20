@@ -244,6 +244,27 @@ def test_estimate_meter_pulls_sixteenth_grid_slip_back() -> None:
     assert abs(phase - 0.25) < 0.03
 
 
+def test_estimate_meter_resolves_beat_three_bass_as_one_beat_pickup() -> None:
+    notes: list[_TimedNote] = []
+    for measure in range(48):
+        base = measure * 4.0
+        # The true downbeat sits one beat after the opening pickup.
+        notes.append(_TimedNote(50, base + 1.0, base + 1.8, 90))
+        notes.append(_TimedNote(62, base + 2.0, base + 2.35, 60))
+        # Later beat-three bass attacks are slightly heavier overall, which
+        # would otherwise create a false three-beat pickup.
+        if measure < 16:
+            notes.append(_TimedNote(60, base + 3.0, base + 3.35, 60))
+        else:
+            notes.append(_TimedNote(40, base + 3.0, base + 3.35, 75))
+        notes.append(_TimedNote(64, base + 4.0, base + 4.35, 60))
+
+    numerator, denominator, phase = _estimate_meter_and_downbeat(notes, lambda value: value)
+
+    assert (numerator, denominator) == (4, 4)
+    assert phase == 1.0
+
+
 def test_estimate_meter_detects_compound_six_eight() -> None:
     # Two dotted-quarter beats per bar, each split into three eighths.
     seconds_per_beat = 0.5

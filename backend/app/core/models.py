@@ -251,6 +251,7 @@ class GridDecision:
     step: int
     score: float
     triplet: bool = False
+    auto_tuplet: bool = False
 
 
 @dataclass(slots=True)

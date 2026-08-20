@@ -65,6 +65,7 @@ class VoiceItem:
     tuplet_start: bool = False
     tuplet_stop: bool = False
     in_tuplet: bool = False
+    tuplet_hidden: bool = False
     boundary_rest: bool = False
     hidden_rest: bool = False
     grace_notes: list[NotationNote] = field(default_factory=list)
@@ -179,6 +180,11 @@ def score_to_musicxml(score: ScoreModel) -> str:
     grid_steps = {
         decision.measure_index: decision.step for decision in score.grid_decisions
     }
+    auto_tuplet_measures = {
+        decision.measure_index
+        for decision in score.grid_decisions
+        if decision.auto_tuplet
+    }
     ottava_spans = detect_ottava_spans(score.notes)
     atoms = _notation_atoms(score.notes, score, ottava_spans)
     atoms_by_location: dict[tuple[int, Staff, int], list[NotationNote]] = defaultdict(list)
@@ -288,6 +294,7 @@ def score_to_musicxml(score: ScoreModel) -> str:
                             measure_span.meter,
                             measure_span.implicit,
                             grid_steps.get(measure_index),
+                            measure_index in auto_tuplet_measures,
                         ),
                     )
                 )
@@ -944,6 +951,7 @@ def _voice_items(
     meter: Meter,
     implicit: bool = False,
     grid_step: int | None = None,
+    auto_tuplet: bool = False,
 ) -> list[VoiceItem]:
     if not atoms:
         return [
@@ -1061,7 +1069,7 @@ def _voice_items(
         raise ValueError(
             f"声部时值总和不等于小节长度：{sum(item.duration for item in items)} != {measure_length}"
         )
-    items = _complete_tuplet_groups(items, meter)
+    items = _complete_tuplet_groups(items, meter, auto_tuplet=auto_tuplet)
     items = _rescue_stranded_ratio_notes(items)
     if _stream_coherent(items, measure_length):
         items = _snap_free_onsets(items, measure_length, meter, implicit, grid_step)
@@ -1547,7 +1555,12 @@ def _spec_for_value(duration: int, grid_step: int | None) -> DurationSpec:
     return SPEC_BY_VALUE.get(duration, DurationSpec(duration, "64th"))
 
 
-def _complete_tuplet_groups(items: list[VoiceItem], meter: Meter) -> list[VoiceItem]:
+def _complete_tuplet_groups(
+    items: list[VoiceItem],
+    meter: Meter,
+    *,
+    auto_tuplet: bool = False,
+) -> list[VoiceItem]:
     """Bracket tuplet groups, completing them by absorbing padding rests.
 
     MuseScore's importer hangs on a time-modified item whose measure-mates do
@@ -1557,7 +1570,12 @@ def _complete_tuplet_groups(items: list[VoiceItem], meter: Meter) -> list[VoiceI
     Short groups pull in adjacent padding rests — split into member units when
     necessary, before the group as well as after it — until the span closes
     exactly; absorbed rests keep their hidden/invisible role, so the bracket
-    simply spans padding the voice already owned.
+    simply spans padding the voice already owned.  For tuplets recovered
+    automatically from noisy audio, only groups supported by at least three
+    real attacks and more sounding than resting members display a bracket and
+    number.  We retain weaker complete groups as invisible timing containers
+    so MusicXML playback stays exact without showing speculative tuplets.
+    Explicit/direct-MIDI tuplets keep the permissive visible legacy rule.
     """
 
     expanded: list[VoiceItem] = []
@@ -1582,6 +1600,23 @@ def _complete_tuplet_groups(items: list[VoiceItem], meter: Meter) -> list[VoiceI
         count = group_sum // smallest
         valid_counts = {(3, 2): (3, 6, 12), (6, 4): (6, 12), (5, 4): (5, 10)}
         return count in valid_counts[group_mod]
+
+    def real_attack_count() -> int:
+        return len(
+            {
+                member.onset
+                for member in group
+                if not member.is_rest
+                and any(not note.tie_stop for note in member.notes)
+            }
+        )
+
+    def auto_group_has_enough_evidence() -> bool:
+        if not auto_tuplet:
+            return True
+        sounding_members = sum(not member.is_rest for member in group)
+        rest_members = len(group) - sounding_members
+        return real_attack_count() >= 3 and sounding_members > rest_members
 
     def absorb_backward() -> None:
         nonlocal group_sum
@@ -1665,10 +1700,15 @@ def _complete_tuplet_groups(items: list[VoiceItem], meter: Meter) -> list[VoiceI
         if group and not is_complete():
             try_alternate_ratios()
         if is_complete() and len(group) >= 2:
+            hide_auto_group = not auto_group_has_enough_evidence()
             group[0].tuplet_start = True
             group[-1].tuplet_stop = True
             for member in group:
                 member.in_tuplet = True
+                if hide_auto_group:
+                    member.tuplet_hidden = True
+                    if member.is_rest:
+                        member.hidden_rest = True
         result.extend(group)
         group = []
         group_mod = None
@@ -2413,7 +2453,7 @@ def _write_item(
         if item.tuplet_start or item.tuplet_stop:
             notations = ET.SubElement(note_element, "notations")
             if item.tuplet_start:
-                ET.SubElement(notations, "tuplet", type="start", bracket="auto")
+                _write_tuplet_start(notations, item)
             if item.tuplet_stop:
                 ET.SubElement(notations, "tuplet", type="stop")
         return
@@ -2462,7 +2502,7 @@ def _write_item(
             if notation_note.tie_start:
                 ET.SubElement(notations, "tied", type="start")
             if note_index == 0 and item.tuplet_start:
-                ET.SubElement(notations, "tuplet", type="start", bracket="auto")
+                _write_tuplet_start(notations, item)
             if note_index == 0 and item.tuplet_stop:
                 ET.SubElement(notations, "tuplet", type="stop")
             if notation_note.arpeggiated:
@@ -2477,6 +2517,15 @@ def _write_item(
                 ornaments = ET.SubElement(notations, "ornaments")
                 tremolo_type = "start" if notation_note.tremolo_start else "stop"
                 ET.SubElement(ornaments, "tremolo", type=tremolo_type).text = "3"
+
+
+def _write_tuplet_start(notations: ET.Element, item: VoiceItem) -> None:
+    attributes = {"type": "start"}
+    if item.tuplet_hidden:
+        attributes.update({"bracket": "no", "show-number": "none"})
+    else:
+        attributes["bracket"] = "auto"
+    ET.SubElement(notations, "tuplet", attributes)
 
 
 def _write_pitch(
@@ -2595,6 +2644,9 @@ def musicxml_readability_metrics(musicxml: str) -> dict[str, object]:
     ]
     tuplet_starts = root.findall(".//notations/tuplet[@type='start']")
     tuplet_stops = root.findall(".//notations/tuplet[@type='stop']")
+    hidden_tuplet_starts = [
+        start for start in tuplet_starts if start.get("show-number") == "none"
+    ]
     return {
         "hidden_padding_rests": sum(note.get("print-object") == "no" for note in rests),
         "visible_rests": sum(note.get("print-object") != "no" for note in rests),
@@ -2609,5 +2661,7 @@ def musicxml_readability_metrics(musicxml: str) -> dict[str, object]:
         ),
         "arpeggiated_noteheads": len(root.findall(".//notations/arpeggiate")),
         "tuplet_spans": len(tuplet_starts),
+        "visible_tuplet_spans": len(tuplet_starts) - len(hidden_tuplet_starts),
+        "hidden_tuplet_spans": len(hidden_tuplet_starts),
         "unbalanced_tuplet_brackets": abs(len(tuplet_starts) - len(tuplet_stops)),
     }

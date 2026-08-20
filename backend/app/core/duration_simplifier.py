@@ -51,6 +51,9 @@ def simplify_polyphonic_durations(
             [],
         )
 
+    coherent_attack_groups = (
+        _coherent_attack_duration_groups(notes) if transcription_mode else []
+    )
     notes, pedal_extended, legato_extended = _extend_release_gaps_to_metric_boundaries(
         notes,
         pedals or [],
@@ -134,6 +137,13 @@ def simplify_polyphonic_durations(
             active_indices.update(indices)
         result.extend(staff_notes)
 
+    coherent_attack_repairs = 0
+    if coherent_attack_groups:
+        result, coherent_attack_repairs = _restore_coherent_attack_durations(
+            result,
+            coherent_attack_groups,
+        )
+
     warnings = []
     if pedal_extended:
         warnings.append(
@@ -151,12 +161,17 @@ def simplify_polyphonic_durations(
         warnings.append(
             f"为消除演奏型重叠并保持最多 {max_voices} 层清晰声部，已规范化 {shortened} 个音符时值（音头全部保留）"
         )
+    if coherent_attack_repairs:
+        warnings.append(
+            f"根据原始同起音与释放关系，统一了 {coherent_attack_repairs} 个八度或和弦音的书写时值"
+        )
     adjusted = (
         pedal_extended
         + legato_extended
         + transcription_extended
         + transcription_normalized
         + shortened
+        + coherent_attack_repairs
     )
     return (
         sorted(result, key=lambda note: (note.onset, note.pitch, note.source_id)),
@@ -167,6 +182,7 @@ def simplify_polyphonic_durations(
             "legato_extended_note_count": legato_extended,
             "transcription_release_extended_note_count": transcription_extended,
             "transcription_release_normalized_note_count": transcription_normalized,
+            "coherent_attack_duration_repair_count": coherent_attack_repairs,
             "method": "transcription_aware_shared_onset_duration_reduction",
         },
         warnings,
@@ -750,6 +766,75 @@ def repair_repeated_rhythm_durations(
     ]
     return (
         sorted(repaired, key=lambda note: (note.onset, note.pitch, note.source_id)),
+        len(replacements),
+    )
+
+
+def _coherent_attack_duration_groups(
+    notes: list[QuantizedNote],
+) -> list[frozenset[int]]:
+    """Remember octave/chord columns whose original gates agreed.
+
+    Audio release inference may legitimately hold a melodic edge over moving
+    accompaniment.  It must not, however, split an octave or chord whose notes
+    arrived together *and* had the same original gate: that manufactures two
+    written voices and leaves visually mismatched noteheads.  Only octave
+    doublings and three-note-or-larger chords are protected, so an intentional
+    two-note contrapuntal attack can still retain independent durations.
+    """
+
+    columns: dict[tuple[Staff, object, int], list[QuantizedNote]] = defaultdict(list)
+    for note in notes:
+        if (
+            note.staff is not None
+            and not note.grace
+            and not note.trill
+            and not note.arpeggiated
+            and not note.tremolo_start
+            and not note.tremolo_stop
+        ):
+            columns[(note.staff, note.hand, note.onset)].append(note)
+
+    groups: list[frozenset[int]] = []
+    maximum_gate_spread = CANONICAL_DIVISIONS // 8
+    for column in columns.values():
+        if len(column) < 2:
+            continue
+        pitches = {note.pitch for note in column}
+        contains_octave = any(pitch + 12 in pitches for pitch in pitches)
+        if not contains_octave and len(column) < 3:
+            continue
+        durations = [note.duration for note in column]
+        if max(durations) - min(durations) > maximum_gate_spread:
+            continue
+        groups.append(frozenset(note.source_id for note in column))
+    return groups
+
+
+def _restore_coherent_attack_durations(
+    notes: list[QuantizedNote],
+    groups: list[frozenset[int]],
+) -> tuple[list[QuantizedNote], int]:
+    by_id = {note.source_id: note for note in notes}
+    replacements: dict[int, int] = {}
+    for source_ids in groups:
+        members = [by_id[source_id] for source_id in source_ids if source_id in by_id]
+        if len(members) < 2:
+            continue
+        target = min(note.duration for note in members)
+        if target <= 0:
+            continue
+        for note in members:
+            if note.duration != target:
+                replacements[note.source_id] = target
+
+    if not replacements:
+        return notes, 0
+    return (
+        [
+            replace(note, duration=replacements.get(note.source_id, note.duration))
+            for note in notes
+        ],
         len(replacements),
     )
 
