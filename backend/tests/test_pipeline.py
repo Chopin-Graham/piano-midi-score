@@ -195,6 +195,67 @@ def test_audio_transcription_reframes_leading_rests_as_pickup() -> None:
     assert any("弱起" in warning for warning in warnings)
 
 
+def _terminal_quintuplet_boundary_midi_bytes() -> bytes:
+    from io import BytesIO
+
+    import mido
+
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+    meta = mido.MidiTrack()
+    piano = mido.MidiTrack()
+    midi.tracks.extend([meta, piano])
+    meta.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(120), time=0))
+    meta.append(
+        mido.MetaMessage(
+            "time_signature",
+            numerator=4,
+            denominator=4,
+            clocks_per_click=24,
+            notated_32nd_notes_per_beat=8,
+            time=0,
+        )
+    )
+    events: list[tuple[int, int, mido.Message]] = []
+    for pitch, onset, end in (
+        (60, 1440, 1632),
+        (62, 1632, 1824),
+        (64, 1824, 1920),
+    ):
+        events.append(
+            (onset, 1, mido.Message("note_on", note=pitch, velocity=80, channel=0))
+        )
+        events.append(
+            (end, 0, mido.Message("note_off", note=pitch, velocity=0, channel=0))
+        )
+    previous = 0
+    for tick, _, message in sorted(events, key=lambda item: (item[0], item[1])):
+        message.time = tick - previous
+        piano.append(message)
+        previous = tick
+    buffer = BytesIO()
+    midi.save(file=buffer)
+    return buffer.getvalue()
+
+
+def test_audio_quintuplet_candidate_cannot_extend_past_final_barline() -> None:
+    xml, analysis, _ = convert_midi(
+        _terminal_quintuplet_boundary_midi_bytes(),
+        "terminal-boundary.mid",
+        ConversionOptions(
+            style="clean",
+            minimum_note="eighth",
+            allow_triplets=True,
+            audio_transcription=True,
+        ),
+    )
+    root = ET.fromstring(xml)
+
+    assert analysis["note_count"] == 3
+    assert len(root.findall(".//note[pitch]")) == 3
+    assert not root.findall(".//note/chord")
+    assert all(int(node.text or "0") > 0 for node in root.findall(".//note/duration"))
+
+
 def test_regular_midi_keeps_full_first_measure_without_pickup_reframe() -> None:
     xml, _, _ = convert_midi(
         _late_start_midi_bytes(1440),

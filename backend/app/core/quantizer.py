@@ -194,11 +194,44 @@ def quantize_midi(
         bucket_grids: dict[tuple[int, tuple[int, int]], GridSpec] = {}
         for bucket_key, bucket_notes in buckets.items():
             bucket_start = measure.start + measure.meter.beat_group_boundaries[bucket_key[0]]
+            bucket_end = (
+                measure.start
+                + measure.meter.beat_group_boundaries[bucket_key[0] + 1]
+            )
+            bucket_length = bucket_end - bucket_start
+            compatible_candidates = [
+                grid for grid in candidates if bucket_length % grid.step == 0
+            ]
+            if not compatible_candidates:
+                # A user-selected coarse minimum can be longer than a short
+                # beat group (for example an eighth-note minimum in 4/16).
+                # Relax only that minimum and keep the remaining style/tuplet
+                # choices; every selected grid must still end on the beat line.
+                fallback_options = candidate_options.model_copy(
+                    update={"minimum_note": "auto"}
+                )
+                compatible_candidates = [
+                    grid
+                    for grid in _grid_candidates(fallback_options, measure.meter)
+                    if bucket_length % grid.step == 0
+                ]
+            final_timeline_bucket = (
+                measure_index == len(measures) - 1 and bucket_end == measure.end
+            )
+            if final_timeline_bucket:
+                distinct_attacks = len({note.onset for note in bucket_notes})
+                boundary_safe_candidates = [
+                    grid
+                    for grid in compatible_candidates
+                    if bucket_length // grid.step >= distinct_attacks
+                ]
+                if boundary_safe_candidates:
+                    compatible_candidates = boundary_safe_candidates
             bucket_candidates = [
                 grid
-                for grid in candidates
+                for grid in compatible_candidates
                 if _fine_grid_has_attack_evidence(bucket_notes, grid, options)
-            ] or candidates
+            ] or compatible_candidates
             high_order_flourish = (
                 options.audio_transcription
                 and len({note.onset for note in bucket_notes}) >= 7
@@ -337,7 +370,7 @@ def quantize_midi(
                 best = _avoid_fast_run_short_interval_merges(
                     bucket_notes,
                     bucket_start,
-                    candidates,
+                    compatible_candidates,
                     best,
                     options.style,
                     onsets_only=True,
@@ -373,12 +406,16 @@ def quantize_midi(
                 measure.start
                 + measure.meter.beat_group_boundaries[beat_index + 1]
             )
+            final_timeline_bucket = (
+                measure_index == len(measures) - 1 and bucket_end == measure.end
+            )
             snapped_attacks = _ordered_attack_snap_map(
                 bucket_notes,
                 bucket_start,
                 bucket_end,
                 grid,
                 options,
+                include_bucket_end=not final_timeline_bucket,
             )
             for note in bucket_notes:
                 snapped_onset = snapped_attacks[note.onset]
@@ -387,6 +424,8 @@ def quantize_midi(
                 snapped_end = bucket_start + _nearest_multiple(
                     note.end - bucket_start, grid.step
                 )
+                if measure_index == len(measures) - 1:
+                    snapped_end = min(snapped_end, measure.end)
                 if snapped_end <= snapped_onset:
                     snapped_end = snapped_onset + grid.step
                 snapped_duration = snapped_end - snapped_onset
@@ -706,6 +745,8 @@ def _ordered_attack_snap_map(
     bucket_end: int,
     grid: GridSpec,
     options: ConversionOptions,
+    *,
+    include_bucket_end: bool = True,
 ) -> dict[int, int]:
     """Jointly snap a rapid line so distinct attacks stay in time order.
 
@@ -716,23 +757,40 @@ def _ordered_attack_snap_map(
     onset remain a chord on one point.
     """
 
+    points = list(
+        range(
+            bucket_start,
+            bucket_end + 1 if include_bucket_end else bucket_end,
+            grid.step,
+        )
+    )
+    if include_bucket_end and points[-1] != bucket_end:
+        points.append(bucket_end)
+
     raw_onsets = sorted({note.onset for note in notes})
     default = {
-        onset: bucket_start
-        + _nearest_multiple(onset - bucket_start, grid.step)
+        onset: min(
+            points[-1],
+            bucket_start + _nearest_multiple(onset - bucket_start, grid.step),
+        )
         for onset in raw_onsets
     }
+    boundary_merge = (
+        not include_bucket_end and len(set(default.values())) < len(raw_onsets)
+    )
     if (
         not options.audio_transcription
-        or not _false_short_interval_merges(
-            notes,
-            bucket_start,
-            grid.step,
+        or (
+            not boundary_merge
+            and not _false_short_interval_merges(
+                notes,
+                bucket_start,
+                grid.step,
+            )
         )
     ):
         return default
 
-    points = list(range(bucket_start, bucket_end + 1, grid.step))
     if len(raw_onsets) > len(points):
         return default
 
