@@ -18,6 +18,8 @@ export interface ConversionOptions {
   time_numerator: number | null;
   time_denominator: 2 | 4 | 8 | 16 | null;
   title: string | null;
+  author: string | null;
+  output_filename: string | null;
 }
 
 export interface TranscriptionOptions {
@@ -39,6 +41,8 @@ export interface ConversionResponse {
   preview_png_base64: string | null;
   analysis: {
     title: string;
+    author?: string | null;
+    output_filename?: string;
     note_count: number;
     measure_count: number;
     duration_quarters?: number;

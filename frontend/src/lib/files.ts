@@ -47,3 +47,29 @@ export function uploadLimitBytes(kind: InputKind): number {
 export function defaultScoreTitle(filename: string): string {
   return filename.replace(/\.[^.]+$/, "");
 }
+
+export function defaultScoreMetadata(filename: string): {
+  title: string;
+  outputFilename: string;
+} {
+  const stem = defaultScoreTitle(filename);
+  return { title: stem, outputFilename: stem };
+}
+
+export function normalizeOutputFilename(
+  value: string | null | undefined,
+  fallback = "score",
+): string {
+  const finalSegment = (value || fallback).split(/[\\/]/).pop()?.trim() || fallback;
+  const withoutKnownExtension = finalSegment.replace(
+    /\.(?:mid|midi|musicxml|xml|mxl|pdf|wav|mp3|flac|m4a|aac|ogg|opus|mp4|mkv|mov|webm)$/i,
+    "",
+  );
+  const safe = withoutKnownExtension
+    .replace(/[<>:"/\\|?*\u0000-\u001f]+/g, "_")
+    .replace(/\s+/g, " ")
+    .replace(/^[ .]+|[ .]+$/g, "")
+    .slice(0, 100)
+    .replace(/[ .]+$/g, "");
+  return safe || fallback;
+}

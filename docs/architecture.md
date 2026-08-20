@@ -104,13 +104,15 @@ MuseScore 使用三套 A4 样式完成最终雕版：
 
 `POST /api/convert` 返回：
 
-- `musicxml` 与建议文件名；
+- `musicxml` 与建议文件名；请求中的 `title`、`author` 会写入乐谱元数据，`output_filename` 会在安全清理后统一用于 MusicXML、PDF 与 MIDI 下载名；
 - `pdf_base64` 与 A4 PDF 文件名（MuseScore 可用时）；
 - `preview_png_base64`，与 PDF 第一页一致；
 - `analysis`，包含量化、左右手、声部、音高拼写、质量与雕版指标；
 - `warnings`，用于提示输入歧义或安全降级。
 
 核心转换保持确定性；Web 层只负责 I/O 和并发边界。
+
+同一组作品元数据参数也适用于上传的 MusicXML/MXL 和 PDF 乐谱。网页在每次选择新文件时，从文件名重新推导标题与默认导出名；作者字段保留，便于连续处理同一作者或编曲者的多个作品。
 
 `POST /api/convert-media` 额外接收 `transcription_options_json`，支持后端、CPU/CUDA、节拍对齐和短音阈值选择；响应除上述内容外还返回 `midi_base64`、中间 MIDI 文件名及 `analysis.transcription`。上传上限为 250 MB，模型任务有一小时保护超时。
 

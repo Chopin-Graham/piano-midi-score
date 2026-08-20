@@ -118,6 +118,18 @@ def test_long_title_uses_smaller_credit_type() -> None:
     assert root.find("./credit/credit-words").get("font-size") == "18"
 
 
+def test_pipeline_preserves_custom_author_in_analysis_and_musicxml() -> None:
+    xml, analysis, _ = convert_midi(
+        piano_midi_bytes(two_tracks=True, measures=1),
+        "nocturne.mid",
+        ConversionOptions(author="F. Chopin"),
+    )
+    root = ET.fromstring(xml)
+
+    assert analysis["author"] == "F. Chopin"
+    assert root.findtext("./identification/creator[@type='composer']") == "F. Chopin"
+
+
 def _late_start_midi_bytes(first_onset: int = 1440) -> bytes:
     from io import BytesIO
 

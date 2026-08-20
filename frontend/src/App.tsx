@@ -5,8 +5,9 @@ import { convertDemo, convertMedia, convertMidi } from "./api";
 import { ScorePreview } from "./components/ScorePreview";
 import {
   classifyInputFilename,
-  defaultScoreTitle,
+  defaultScoreMetadata,
   FILE_INPUT_ACCEPT,
+  normalizeOutputFilename,
   uploadLimitBytes,
 } from "./lib/files";
 import { downloadBase64, downloadText, formatBytes, formatKey } from "./lib/format";
@@ -35,6 +36,8 @@ const DEFAULT_OPTIONS: ConversionOptions = {
   time_numerator: null,
   time_denominator: null,
   title: null,
+  author: null,
+  output_filename: null,
 };
 
 const DEFAULT_TRANSCRIPTION_OPTIONS: TranscriptionOptions = {
@@ -59,6 +62,12 @@ export default function App() {
   const isMedia = inputKind === "media";
   const isPdf = inputKind === "pdf";
   const fixedSplit = typeof options.hand_split === "number";
+  const outputStem = normalizeOutputFilename(
+    options.output_filename,
+    file ? defaultScoreMetadata(file.name).outputFilename : "score",
+  );
+  const previewTitle = result?.analysis.title ?? options.title ?? "等待生成";
+  const previewAuthor = result?.analysis.author ?? options.author;
 
   const canConvert = Boolean(file) && !loading;
   const keyLabel = useMemo(() => {
@@ -93,9 +102,11 @@ export default function App() {
     setFile(nextFile);
     setResult(null);
     setError(null);
+    const metadata = defaultScoreMetadata(nextFile.name);
     setOptions((current) => ({
       ...current,
-      title: current.title || defaultScoreTitle(nextFile.name),
+      title: metadata.title,
+      output_filename: metadata.outputFilename,
       allow_triplets: nextKind === "media" ? false : current.allow_triplets,
       include_pedal: nextKind !== "media",
     }));
@@ -133,8 +144,14 @@ export default function App() {
     setLoading(true);
     setError(null);
     setFile(null);
+    const demoOptions = {
+      ...options,
+      title: "Piano Demo",
+      output_filename: "demo-piano",
+    };
+    setOptions(demoOptions);
     try {
-      setResult(await convertDemo({ ...options, title: options.title || "Piano Demo" }));
+      setResult(await convertDemo(demoOptions));
     } catch (conversionError) {
       setResult(null);
       setError(conversionError instanceof Error ? conversionError.message : "示例转换失败");
@@ -164,7 +181,7 @@ export default function App() {
               <div><h2>选择输入文件</h2><p>MIDI 直接制谱，音视频先转录为 MIDI</p></div>
             </div>
             <label
-              className={`drop-zone ${dragging ? "dragging" : ""}`}
+              className={`drop-zone ${dragging ? "dragging" : ""} ${file ? "has-file" : ""}`}
               onDragEnter={() => setDragging(true)}
               onDragLeave={() => setDragging(false)}
               onDragOver={(event) => event.preventDefault()}
@@ -189,10 +206,66 @@ export default function App() {
             </button>
           </section>
 
+          <section className="metadata-section">
+            <div className="section-heading">
+              <span>02</span>
+              <div><h2>作品信息</h2><p>标题写入乐谱，文件名用于下载</p></div>
+            </div>
+            <div className="metadata-card">
+              <label className="field metadata-title-field">
+                <span>乐谱标题</span>
+                <input
+                  type="text"
+                  maxLength={120}
+                  value={options.title ?? ""}
+                  placeholder="选择文件后自动同步"
+                  onChange={(event) =>
+                    setOptions({ ...options, title: event.target.value || null })
+                  }
+                />
+                <small className="field-hint">选择新文件时会自动更新，之后仍可自由修改。</small>
+              </label>
+              <div className="metadata-grid">
+                <label className="field">
+                  <span>作者 / 编曲</span>
+                  <input
+                    type="text"
+                    maxLength={120}
+                    value={options.author ?? ""}
+                    placeholder="例如：F. Chopin"
+                    onChange={(event) =>
+                      setOptions({ ...options, author: event.target.value || null })
+                    }
+                  />
+                </label>
+                <label className="field">
+                  <span>导出文件名</span>
+                  <input
+                    type="text"
+                    maxLength={120}
+                    value={options.output_filename ?? ""}
+                    placeholder="例如：夜曲-最终版"
+                    onChange={(event) =>
+                      setOptions({
+                        ...options,
+                        output_filename: event.target.value || null,
+                      })
+                    }
+                  />
+                </label>
+              </div>
+              <div className="output-preview" aria-live="polite">
+                <span>导出预览</span>
+                <strong>{outputStem}.musicxml</strong>
+                <small>{outputStem}-A4.pdf</small>
+              </div>
+            </div>
+          </section>
+
           {isPdf && (
             <section className="transcription-section">
               <div className="section-heading">
-                <span>02</span>
+                <span>03</span>
                 <div><h2>PDF 乐谱识别</h2><p>光学识别（OMR）为 MusicXML 与 MIDI</p></div>
               </div>
               <div className="transcription-notice">
@@ -205,7 +278,7 @@ export default function App() {
           {isMedia && (
             <section className="transcription-section">
               <div className="section-heading">
-                <span>02</span>
+                <span>03</span>
                 <div><h2>音频转录</h2><p>钢琴专用模型 + 动态节拍对齐</p></div>
               </div>
               <div className="transcription-notice">
@@ -275,7 +348,7 @@ export default function App() {
 
           <section>
             <div className="section-heading">
-              <span>{isMedia || isPdf ? "03" : "02"}</span>
+              <span>{isMedia || isPdf ? "04" : "03"}</span>
               <div><h2>谱面风格</h2><p>先追求清楚，再追求细节</p></div>
             </div>
             <div className="segmented" role="group" aria-label="谱面风格">
@@ -321,17 +394,6 @@ export default function App() {
                 <option value="sixteenth">十六分音符</option>
                 <option value="thirty_second">三十二分音符</option>
               </select>
-            </label>
-
-            <label className="field">
-              <span>乐谱标题</span>
-              <input
-                type="text"
-                maxLength={120}
-                value={options.title ?? ""}
-                placeholder="自动使用文件名"
-                onChange={(event) => setOptions({ ...options, title: event.target.value || null })}
-              />
             </label>
 
             <div className="toggle-list">
@@ -390,9 +452,10 @@ export default function App() {
 
         <section className="preview-panel">
           <div className="preview-toolbar">
-            <div>
+            <div className="preview-title-block">
               <span className="eyebrow">SCORE PREVIEW</span>
-              <h2>{result?.analysis.title ?? "等待生成"}</h2>
+              <h2>{previewTitle}</h2>
+              {previewAuthor ? <p>作者 · {previewAuthor}</p> : null}
             </div>
             <div className="toolbar-actions">
               <button

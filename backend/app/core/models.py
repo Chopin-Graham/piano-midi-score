@@ -263,6 +263,7 @@ class ScoreModel:
     pedals: list[PedalEvent]
     grid_decisions: list[GridDecision]
     measure_count: int
+    author: str | None = None
     engraving_style: str = "classic"
     measures: list[MeasureSpan] = field(default_factory=list)
     clef_changes: list[ClefChange] = field(default_factory=list)

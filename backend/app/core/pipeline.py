@@ -308,6 +308,7 @@ def convert_midi_with_score(
     staff_analysis["ledger_pressure_notes"] = quality["ledger_pressure_notes"]
 
     title = _clean_title(options.title or _title_from_midi(parsed.track_names, filename))
+    author = _clean_optional_credit(options.author)
 
     measure_count = len(measures)
     score = ScoreModel(
@@ -319,6 +320,7 @@ def convert_midi_with_score(
         pedals=engraved_pedals,
         grid_decisions=grid_decisions,
         measure_count=measure_count,
+        author=author,
         engraving_style=options.engraving_style,
         measures=measures,
         clef_changes=clef_changes,
@@ -338,6 +340,7 @@ def convert_midi_with_score(
     duration_quarters = max(note.end for note in notes) / CANONICAL_DIVISIONS
     analysis = {
         "title": title,
+        "author": author,
         "note_count": len(notes),
         "measure_count": measure_count,
         "duration_quarters": round(duration_quarters, 2),
@@ -602,6 +605,13 @@ def _is_useful_track_title(name: str) -> bool:
 def _clean_title(title: str) -> str:
     title = re.sub(r"[\x00-\x1f]+", " ", title).strip()
     return title[:120] or "Untitled Piano Score"
+
+
+def _clean_optional_credit(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = re.sub(r"[\x00-\x1f]+", " ", value).strip()
+    return cleaned[:120] or None
 
 
 def _complexity_score(score: ScoreModel) -> int:

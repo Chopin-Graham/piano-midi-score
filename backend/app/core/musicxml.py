@@ -172,7 +172,7 @@ def score_to_musicxml(score: ScoreModel) -> str:
     root = ET.Element("score-partwise", version="4.0")
     _add_work_and_identification(root, score)
     _add_defaults(root, score.engraving_style)
-    _add_credit(root, score.title, score.engraving_style)
+    _add_credit(root, score.title, score.author, score.engraving_style)
     _add_part_list(root)
 
     part = ET.SubElement(root, "part", id="P1")
@@ -363,6 +363,8 @@ def _add_work_and_identification(root: ET.Element, score: ScoreModel) -> None:
     work = ET.SubElement(root, "work")
     ET.SubElement(work, "work-title").text = score.title
     identification = ET.SubElement(root, "identification")
+    if score.author:
+        ET.SubElement(identification, "creator", type="composer").text = score.author
     encoding = ET.SubElement(identification, "encoding")
     ET.SubElement(encoding, "software").text = f"Piano MIDI Score {__version__}"
     supports = ET.SubElement(encoding, "supports", element="print", type="yes")
@@ -438,7 +440,12 @@ def _add_defaults(root: ET.Element, engraving_style: str) -> None:
         ("heavy barline", "5.0"),
     ):
         ET.SubElement(appearance, "line-width", type=line_type).text = width
-def _add_credit(root: ET.Element, title: str, engraving_style: str) -> None:
+def _add_credit(
+    root: ET.Element,
+    title: str,
+    author: str | None,
+    engraving_style: str,
+) -> None:
     geometry = _page_geometry(engraving_style)
     if len(title) <= 42:
         font_size = "22"
@@ -459,6 +466,22 @@ def _add_credit(root: ET.Element, title: str, engraving_style: str) -> None:
             "font-size": font_size,
         },
     ).text = title
+    if author:
+        author_credit = ET.SubElement(root, "credit", page="1")
+        ET.SubElement(author_credit, "credit-type").text = "composer"
+        ET.SubElement(
+            author_credit,
+            "credit-words",
+            {
+                "default-x": str(
+                    int(geometry["width"]) - int(geometry["side_margin"])
+                ),
+                "default-y": str(int(geometry["credit_y"]) - 48),
+                "justify": "right",
+                "valign": "top",
+                "font-size": "11",
+            },
+        ).text = author
 
 
 def _add_part_list(root: ET.Element) -> None:

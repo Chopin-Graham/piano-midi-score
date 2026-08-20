@@ -3,10 +3,12 @@ import { describe, it } from "node:test";
 
 import {
   classifyInputFilename,
+  defaultScoreMetadata,
   defaultScoreTitle,
   MAX_MEDIA_BYTES,
   MAX_MIDI_BYTES,
   MAX_PDF_BYTES,
+  normalizeOutputFilename,
   uploadLimitBytes,
 } from "./files";
 
@@ -32,5 +34,14 @@ describe("input file helpers", () => {
 
   it("derives a readable title from the final extension", () => {
     assert.equal(defaultScoreTitle("golden.hour.mp3"), "golden.hour");
+    assert.deepEqual(defaultScoreMetadata("new.performance.mid"), {
+      title: "new.performance",
+      outputFilename: "new.performance",
+    });
+  });
+
+  it("normalizes a custom export filename without losing readable text", () => {
+    assert.equal(normalizeOutputFilename("  夜曲：最终版.pdf  "), "夜曲：最终版");
+    assert.equal(normalizeOutputFilename("folder/unsafe:name.musicxml"), "unsafe_name");
   });
 });

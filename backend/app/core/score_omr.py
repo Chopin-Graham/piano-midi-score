@@ -16,6 +16,7 @@ import tempfile
 import time
 import zipfile
 from dataclasses import dataclass, field
+from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -249,96 +250,172 @@ def _read_export(export_path: Path) -> str:
     return text
 
 
-def _repair_omr_musicxml(text: str) -> str:
-    """Make Audiveris exports loadable: balance every voice's measure total.
+def normalize_omr_musicxml(text: str) -> tuple[str, dict[str, object]]:
+    """Remove unsafe OMR structures and report whether notes need rebuilding.
 
-    Audiveris occasionally exports measures whose voices do not fill the bar
-    (or overflow it), and strict importers reject the whole file over a single
-    such measure.  MusicXML measures use one shared cursor with ``<backup>``
-    rewinds; the repair recomputes that timeline and only touches a voice
-    whose total genuinely disagrees with the bar: underfull voices gain a
-    trailing ``<forward>``, overfull voices have their final element shortened.
+    Audiveris can mistake long brackets beneath a system for first/second
+    endings.  When a part contains no repeat barline at all, those endings are
+    necessarily orphaned; MuseScore may then skip large ranges while exporting
+    MIDI.  They are safe to remove.
+
+    The function deliberately does *not* pad or truncate individual voices.
+    MusicXML has one shared cursor per measure, so voice-by-voice duration
+    edits corrupt otherwise valid polyphony.  Instead, serious cursor overflow
+    is reported so the caller can rebuild the recognized notes on fixed bar
+    boundaries.
     """
 
+    analysis: dict[str, object] = {
+        "removed_orphan_endings": 0,
+        "measure_timing_anomalies": 0,
+        "severe_measure_timing_anomalies": 0,
+        "semantic_rebuild_recommended": False,
+    }
     try:
         root = ET.fromstring(text)
     except ET.ParseError:
-        return text
+        return text, analysis
     if root.tag != "score-partwise":
-        return text
+        return text, analysis
 
-    for part in root.iter("part"):
-        divisions = 1
-        beats = 4
-        beat_type = 4
-        for measure in part.iter("measure"):
-            for attributes in measure.iter("attributes"):
-                div_text = attributes.findtext("divisions")
-                if div_text and div_text.isdigit():
-                    divisions = max(1, int(div_text))
-                beats_text = attributes.findtext("time/beats")
-                beat_type_text = attributes.findtext("time/beat-type")
-                if beats_text and beat_type_text:
-                    try:
-                        beats = int(beats_text)
-                        beat_type = int(beat_type_text)
-                    except ValueError:
-                        pass
-            expected = round(divisions * beats * 4 / beat_type)
-            if expected <= 0:
+    removed_endings = 0
+    timing_anomalies = 0
+    severe_timing_anomalies = 0
+    for part in root.findall("./part"):
+        if not part.findall(".//repeat"):
+            parents = {
+                child: parent
+                for parent in part.iter()
+                for child in parent
+            }
+            for ending in list(part.iter("ending")):
+                parent = parents.get(ending)
+                if parent is not None:
+                    parent.remove(ending)
+                    removed_endings += 1
+
+        part_anomalies, part_severe = _measure_timing_anomalies(part)
+        timing_anomalies += part_anomalies
+        severe_timing_anomalies += part_severe
+
+    analysis.update(
+        {
+            "removed_orphan_endings": removed_endings,
+            "measure_timing_anomalies": timing_anomalies,
+            "severe_measure_timing_anomalies": severe_timing_anomalies,
+            "semantic_rebuild_recommended": bool(
+                removed_endings or severe_timing_anomalies
+            ),
+        }
+    )
+    if not removed_endings:
+        return text, analysis
+    return (
+        ET.tostring(root, encoding="unicode", xml_declaration=True),
+        analysis,
+    )
+
+
+def _measure_timing_anomalies(part: ET.Element) -> tuple[int, int]:
+    """Count malformed measure spans using MusicXML's shared cursor model."""
+
+    divisions = 1
+    expected = Fraction(4, 1)
+    anomalies = 0
+    severe = 0
+    measures = part.findall("./measure")
+    for index, measure in enumerate(measures):
+        cursor = Fraction(0, 1)
+        minimum_cursor = cursor
+        maximum_cursor = cursor
+        for element in measure:
+            if element.tag == "attributes":
+                divisions = _read_divisions(element, divisions)
+                expected = _read_time_duration(element, expected)
                 continue
 
-            children = list(measure)
-            # Single shared cursor; <backup> rewinds it.  A voice's end is the
-            # cursor value right after its last written element.
-            cursor = 0
-            voice_end: dict[tuple[str, str], int] = {}
-            voice_last_index: dict[tuple[str, str], int] = {}
-            for index, element in enumerate(children):
-                if element.tag == "backup":
-                    duration_text = element.findtext("duration")
-                    if duration_text and duration_text.lstrip("-").isdigit():
-                        cursor -= int(duration_text)
-                    continue
-                if element.tag not in {"note", "forward"}:
-                    continue
-                duration_text = element.findtext("duration")
-                duration = int(duration_text) if duration_text and duration_text.isdigit() else 0
-                voice = element.findtext("voice") or "1"
-                staff = element.findtext("staff") or "1"
-                key = (staff, voice)
-                if element.tag == "forward":
-                    cursor += duration
-                elif element.find("chord") is not None:
-                    end = cursor + duration
-                    if end > voice_end.get(key, 0):
-                        voice_end[key] = end
-                    continue
-                else:
-                    cursor += duration
-                if cursor > voice_end.get(key, 0):
-                    voice_end[key] = cursor
-                voice_last_index[key] = index
+            duration = _duration_in_quarter_beats(element, divisions)
+            if element.tag == "backup":
+                cursor -= duration
+            elif element.tag == "forward" or (
+                element.tag == "note"
+                and element.find("chord") is None
+                and element.find("grace") is None
+            ):
+                cursor += duration
+            minimum_cursor = min(minimum_cursor, cursor)
+            maximum_cursor = max(maximum_cursor, cursor)
 
-            for (staff, voice), end in voice_end.items():
-                gap = expected - end
-                if gap == 0:
-                    continue
-                if gap > 0:
-                    forward = ET.Element("forward")
-                    ET.SubElement(forward, "duration").text = str(gap)
-                    ET.SubElement(forward, "voice").text = voice
-                    ET.SubElement(forward, "staff").text = staff
-                    insert_at = voice_last_index.get((staff, voice), len(children) - 1) + 1
-                    measure.insert(insert_at, forward)
-                else:
-                    last = children[voice_last_index.get((staff, voice), len(children) - 1)]
-                    duration_element = last.find("duration")
-                    if duration_element is not None and duration_element.text:
-                        current = int(duration_element.text)
-                        duration_element.text = str(max(1, current + gap))
+        implicit = measure.get("implicit") == "yes"
+        if minimum_cursor < 0 or (not implicit and maximum_cursor != expected):
+            anomalies += 1
 
-    return ET.tostring(root, encoding="unicode", xml_declaration=True)
+        overflow = maximum_cursor - expected
+        underflow = expected - maximum_cursor
+        severe_overflow = max(Fraction(1, 2), expected / 8)
+        severe_underflow = max(Fraction(1, 1), expected / 4)
+        internal_measure = 0 < index < len(measures) - 1
+        if (
+            minimum_cursor < 0
+            or overflow >= severe_overflow
+            or (not implicit and internal_measure and underflow >= severe_underflow)
+        ):
+            severe += 1
+    return anomalies, severe
+
+
+def _read_divisions(attributes: ET.Element, current: int) -> int:
+    value = attributes.findtext("divisions")
+    try:
+        parsed = int(value) if value is not None else current
+    except ValueError:
+        return current
+    return max(1, parsed)
+
+
+def _read_time_duration(
+    attributes: ET.Element,
+    current: Fraction,
+) -> Fraction:
+    time_element = attributes.find("time")
+    if time_element is None or time_element.find("senza-misura") is not None:
+        return current
+
+    beats_elements = time_element.findall("beats")
+    beat_type_elements = time_element.findall("beat-type")
+    if not beats_elements or len(beats_elements) != len(beat_type_elements):
+        return current
+
+    duration = Fraction(0, 1)
+    try:
+        for beats_element, beat_type_element in zip(
+            beats_elements,
+            beat_type_elements,
+            strict=True,
+        ):
+            beat_type = int(beat_type_element.text or "0")
+            if beat_type <= 0:
+                return current
+            beats = sum(
+                int(component.strip())
+                for component in (beats_element.text or "").split("+")
+            )
+            duration += Fraction(beats * 4, beat_type)
+    except ValueError:
+        return current
+    return duration if duration > 0 else current
+
+
+def _duration_in_quarter_beats(
+    element: ET.Element,
+    divisions: int,
+) -> Fraction:
+    value = element.findtext("duration")
+    try:
+        duration = int(value) if value is not None else 0
+    except ValueError:
+        duration = 0
+    return Fraction(max(0, duration), max(1, divisions))
 
 
 # ---------------------------------------------------------------------------
@@ -358,69 +435,77 @@ class OmrNote:
 
 
 def parse_omr_notes(text: str) -> list[OmrNote]:
-    """Pull every note out of an OMR MusicXML export, tolerating broken bars.
+    """Pull notes from partwise MusicXML on stable measure boundaries.
 
-    Audiveris exports occasionally carry corrupt measures that strict
-    importers reject; the notation pipeline below only needs pitches and a
-    continuous timeline, which ``<duration>`` ticks provide.  Voices advance
-    their own cursors; ``<backup>`` rewinds; ties merge into the open note.
+    MusicXML uses one cursor shared by all voices inside each measure;
+    ``<backup>`` rewinds that cursor before another voice or staff is written.
+    Audiveris can overfill an isolated measure, so normal measures always
+    advance by the current time signature instead of allowing one bad bar to
+    shift the remainder of the piece.
     """
 
     try:
         root = ET.fromstring(text)
     except ET.ParseError:
         return []
-    if root.tag not in {"score-partwise", "score-timewise"}:
+    if root.tag != "score-partwise":
         return []
 
     notes: list[OmrNote] = []
-    for part in root.iter("part"):
-        divisions = 1.0
-        cursors: dict[str, float] = {}
-        open_ties: dict[tuple[str, int], OmrNote] = {}
-        for measure in part.iter("measure"):
+    for part_index, part in enumerate(root.findall("./part")):
+        divisions = 1
+        measure_duration = Fraction(4, 1)
+        measure_start = Fraction(0, 1)
+        open_ties: dict[tuple[int, int, str, int], OmrNote] = {}
+        for measure in part.findall("./measure"):
+            cursor = Fraction(0, 1)
+            maximum_cursor = cursor
+            chord_onsets: dict[tuple[int, str], Fraction] = {}
             for element in measure:
                 if element.tag == "attributes":
-                    div_text = element.findtext("divisions")
-                    if div_text and div_text.isdigit():
-                        divisions = max(1.0, float(int(div_text)))
+                    divisions = _read_divisions(element, divisions)
+                    measure_duration = _read_time_duration(
+                        element,
+                        measure_duration,
+                    )
                     continue
                 if element.tag == "backup":
-                    duration_text = element.findtext("duration")
-                    if duration_text and duration_text.lstrip("-").isdigit():
-                        # Rewind every voice sharing the cursor position is
-                        # wrong; Audiveris backups rewind the whole part
-                        # timeline, so shift all voices that sit at the tip.
-                        back = int(duration_text) / divisions
-                        if cursors:
-                            tip = max(cursors.values())
-                            for voice in cursors:
-                                if cursors[voice] == tip:
-                                    cursors[voice] = tip - back
-                        continue
+                    cursor = max(
+                        Fraction(0, 1),
+                        cursor - _duration_in_quarter_beats(element, divisions),
+                    )
                     continue
                 if element.tag == "forward":
-                    duration_text = element.findtext("duration")
-                    if duration_text and duration_text.isdigit():
-                        voice = element.findtext("voice") or "1"
-                        cursors[voice] = cursors.get(voice, 0.0) + int(duration_text) / divisions
+                    cursor += _duration_in_quarter_beats(element, divisions)
+                    maximum_cursor = max(maximum_cursor, cursor)
                     continue
                 if element.tag != "note":
                     continue
 
-                duration_text = element.findtext("duration")
-                duration = (int(duration_text) / divisions) if duration_text and duration_text.isdigit() else 0.0
+                duration = _duration_in_quarter_beats(element, divisions)
                 voice = element.findtext("voice") or "1"
                 staff_text = element.findtext("staff")
                 staff = int(staff_text) if staff_text and staff_text.isdigit() else 1
                 is_rest = element.find("rest") is not None
                 is_chord = element.find("chord") is not None
+                is_grace = element.find("grace") is not None
+                voice_key = (staff, voice)
 
-                if is_chord and notes:
-                    onset = notes[-1].onset
+                if is_chord:
+                    local_onset = chord_onsets.get(
+                        voice_key,
+                        max(Fraction(0, 1), cursor - duration),
+                    )
                 else:
-                    onset = cursors.get(voice, 0.0)
-                    cursors[voice] = onset + duration
+                    local_onset = cursor
+                    chord_onsets[voice_key] = local_onset
+                    if not is_grace:
+                        cursor += duration
+                maximum_cursor = max(
+                    maximum_cursor,
+                    cursor,
+                    local_onset + duration,
+                )
                 if is_rest:
                     continue
                 pitch_element = element.find("pitch")
@@ -428,27 +513,53 @@ def parse_omr_notes(text: str) -> list[OmrNote]:
                     continue
                 step = pitch_element.findtext("step")
                 octave_text = pitch_element.findtext("octave")
-                if not step or not octave_text:
+                if not step or not octave_text or step.upper() not in _STEP_TO_PC:
                     continue
                 alter_text = pitch_element.findtext("alter")
-                alter = int(float(alter_text)) if alter_text else 0
-                pitch = (int(octave_text) + 1) * 12 + _STEP_TO_PC.get(step.upper(), 0) + alter
+                try:
+                    alter = round(float(alter_text)) if alter_text else 0
+                    octave = int(octave_text)
+                except ValueError:
+                    continue
+                pitch = (octave + 1) * 12 + _STEP_TO_PC[step.upper()] + alter
+                onset = float(measure_start + local_onset)
+                note_duration = max(float(duration), 0.05)
 
-                tie_stop = element.find("tie[@type='stop']") is not None
-                tie_start = element.find("tie[@type='start']") is not None
-                if tie_stop and (voice, pitch) in open_ties:
-                    open_note = open_ties.pop((voice, pitch))
-                    open_note.duration = max(open_note.duration, onset + duration - open_note.onset)
+                tie_types = {
+                    tie.get("type")
+                    for tie in [
+                        *element.findall("tie"),
+                        *element.findall("notations/tied"),
+                    ]
+                }
+                tie_stop = "stop" in tie_types
+                tie_start = "start" in tie_types
+                tie_key = (part_index, staff, voice, pitch)
+                if tie_stop and tie_key in open_ties:
+                    open_note = open_ties[tie_key]
+                    open_note.duration = max(
+                        open_note.duration,
+                        onset + note_duration - open_note.onset,
+                    )
                     if not tie_start:
-                        continue
-                    # tie continues: fall through and re-open below
-                    if tie_start:
-                        open_ties[(voice, pitch)] = open_note
-                        continue
-                note = OmrNote(pitch=pitch, onset=onset, duration=max(duration, 0.05), staff=staff, voice=int(voice) if voice.isdigit() else 1)
+                        del open_ties[tie_key]
+                    continue
+
+                note = OmrNote(
+                    pitch=pitch,
+                    onset=onset,
+                    duration=note_duration,
+                    staff=staff,
+                    voice=int(voice) if voice.isdigit() else 1,
+                )
                 notes.append(note)
                 if tie_start:
-                    open_ties[(voice, pitch)] = note
+                    open_ties[tie_key] = note
+
+            if measure.get("implicit") == "yes" and maximum_cursor > 0:
+                measure_start += min(maximum_cursor, measure_duration)
+            else:
+                measure_start += measure_duration
     return notes
 
 

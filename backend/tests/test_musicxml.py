@@ -63,6 +63,15 @@ def test_musicxml_identification_uses_release_version() -> None:
     )
 
 
+def test_musicxml_writes_author_as_composer_credit() -> None:
+    score = _score([])
+    score.author = "F. Chopin"
+    root = ET.fromstring(score_to_musicxml(score))
+
+    assert root.findtext("./identification/creator[@type='composer']") == "F. Chopin"
+    assert root.findtext("./credit[credit-type='composer']/credit-words") == "F. Chopin"
+
+
 def test_empty_compound_staff_uses_one_measure_rest() -> None:
     meter = Meter(6, 8)
     notes = [

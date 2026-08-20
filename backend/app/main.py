@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from io import BytesIO
 from pathlib import Path
 from typing import Annotated
@@ -31,7 +32,7 @@ from .core.roundtrip import musicxml_to_midi_bytes
 from .core.score_omr import (
     ScoreOmrError,
     ScoreOmrUnavailableError,
-    _repair_omr_musicxml,
+    normalize_omr_musicxml,
     omr_notes_to_midi_bytes,
     omr_status,
     parse_omr_notes,
@@ -137,12 +138,12 @@ async def convert(
     )
     analysis["engraving"] = engraving.analysis
     warnings.extend(engraving.warnings)
-    output_name = f"{Path(filename).stem or 'score'}.musicxml"
-    pdf_name = f"{Path(filename).stem or 'score'}-A4.pdf" if engraving.pdf_bytes else None
+    stem = _safe_output_stem(filename, conversion_options.output_filename, "score")
+    analysis["output_filename"] = stem
     return ConversionResponse(
-        filename=output_name,
+        filename=f"{stem}.musicxml",
         musicxml=musicxml,
-        pdf_filename=pdf_name,
+        pdf_filename=f"{stem}-A4.pdf" if engraving.pdf_bytes else None,
         pdf_base64=_encode_bytes(engraving.pdf_bytes),
         preview_png_base64=_encode_bytes(engraving.preview_png),
         analysis=analysis,
@@ -219,6 +220,11 @@ async def _convert_score_upload(
     """
 
     musicxml = _decode_score_upload(data, filename)
+    musicxml = _apply_score_metadata(
+        musicxml,
+        title=conversion_options.title,
+        author=conversion_options.author,
+    )
     engraving = await run_in_threadpool(
         render_a4_musicxml,
         musicxml,
@@ -242,7 +248,9 @@ async def _convert_score_upload(
     else:
         warnings.append("未找到 MuseScore Studio 4，无法从 MusicXML 导出 MIDI")
 
-    stem = Path(filename).stem or "score"
+    stem = _safe_output_stem(filename, conversion_options.output_filename, "score")
+    analysis = _score_upload_analysis(musicxml, filename, engraving.analysis)
+    analysis["output_filename"] = stem
     return ConversionResponse(
         filename=f"{stem}.musicxml",
         musicxml=musicxml,
@@ -251,7 +259,7 @@ async def _convert_score_upload(
         pdf_filename=f"{stem}-A4.pdf" if engraving.pdf_bytes else None,
         pdf_base64=_encode_bytes(engraving.pdf_bytes),
         preview_png_base64=_encode_bytes(engraving.preview_png),
-        analysis=_score_upload_analysis(musicxml, filename, engraving.analysis),
+        analysis=analysis,
         warnings=list(dict.fromkeys(warnings)),
     )
 
@@ -263,10 +271,10 @@ async def _convert_score_pdf_upload(
 ) -> ConversionResponse:
     """Recognize a PDF score via OMR, then handle it like a MusicXML upload.
 
-    The OMR export is engraved directly when it loads; when the recognition
-    left broken measures no importer accepts, the notes are extracted
-    tolerantly and re-engraved through the semantic MIDI pipeline — the user
-    always gets a loadable score, never a bare error.
+    Structurally healthy OMR output is engraved directly. Orphaned endings or
+    seriously malformed measure cursors trigger a note-level semantic rebuild
+    even when MuseScore can technically open the raw export, because those
+    defects otherwise cause skipped passages and cumulative rhythm drift.
     """
 
     try:
@@ -277,57 +285,101 @@ async def _convert_score_pdf_upload(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     stem = Path(filename).stem or "score"
+    output_stem = _safe_output_stem(filename, conversion_options.output_filename, "score")
+    normalized_musicxml, structure_analysis = normalize_omr_musicxml(omr.musicxml)
+    omr_analysis = {**omr.analysis, **structure_analysis}
     response = await _convert_score_upload(
-        omr.musicxml.encode("utf-8"),
+        normalized_musicxml.encode("utf-8"),
         f"{stem}.musicxml",
         conversion_options,
     )
-    if response.pdf_base64 is None:
-        # The raw export would not render: try the measure-balanced repair
-        # before falling back to a full semantic rebuild.
-        repaired = _repair_omr_musicxml(omr.musicxml)
-        if repaired != omr.musicxml:
-            response = await _convert_score_upload(
-                repaired.encode("utf-8"),
-                f"{stem}.musicxml",
-                conversion_options,
-            )
-            if response.pdf_base64 is not None:
-                response.warnings.append(
-                    "OMR 输出的破损小节已自动补齐/截齐后完成雕版"
-                )
-    if response.pdf_base64 is None:
-        # The OMR export would not render at all: rebuild from the notes.
-        notes = parse_omr_notes(omr.musicxml)
+
+    removed_endings = int(structure_analysis["removed_orphan_endings"])
+    severe_measures = int(
+        structure_analysis["severe_measure_timing_anomalies"]
+    )
+    structure_warnings: list[str] = []
+    if removed_endings:
+        structure_warnings.append(
+            f"检测到 {removed_endings} 个没有对应反复记号的结局线，"
+            "疑似由横向括号误识别，已安全移除"
+        )
+    if severe_measures:
+        structure_warnings.append(
+            f"检测到 {severe_measures} 个小节的 MusicXML 时间轴严重异常，"
+            "将按固定小节边界重建，避免节奏错误向后累积"
+        )
+
+    engraving_analysis = response.analysis.get("engraving", {})
+    raw_render_failed = bool(
+        response.pdf_base64 is None
+        and isinstance(engraving_analysis, dict)
+        and engraving_analysis.get("engine") == "MuseScore Studio 4"
+        and not engraving_analysis.get("available", True)
+    )
+    should_rebuild = bool(
+        structure_analysis["semantic_rebuild_recommended"] or raw_render_failed
+    )
+    semantic_rebuilt = False
+    if should_rebuild:
+        notes = parse_omr_notes(normalized_musicxml)
         if notes:
-            synthetic_midi = omr_notes_to_midi_bytes(notes)
-            musicxml, analysis, warnings = await run_in_threadpool(
-                convert_midi,
-                synthetic_midi,
-                f"{stem}.mid",
-                conversion_options,
+            try:
+                synthetic_midi = omr_notes_to_midi_bytes(notes)
+                musicxml, analysis, warnings = await run_in_threadpool(
+                    convert_midi,
+                    synthetic_midi,
+                    f"{stem}.mid",
+                    conversion_options,
+                )
+                (
+                    musicxml,
+                    analysis,
+                    warnings,
+                    engraving,
+                ) = await _engrave_with_safe_fallback(
+                    synthetic_midi,
+                    f"{stem}.mid",
+                    musicxml,
+                    analysis,
+                    warnings,
+                    conversion_options,
+                )
+            except (MidiParseError, OSError, RuntimeError, ValueError, ZeroDivisionError) as exc:
+                response.warnings.append(
+                    f"OMR 结构异常，但语义重建失败，已保留清理后的识别结果：{exc}"
+                )
+            else:
+                analysis["engraving"] = engraving.analysis
+                analysis["output_filename"] = output_stem
+                warnings.extend(engraving.warnings)
+                warnings.append(
+                    "OMR 结构异常，已按识别音符和固定小节边界重新制谱；"
+                    "原始文字、力度和连线可能无法完整保留"
+                )
+                response = ConversionResponse(
+                    filename=f"{output_stem}.musicxml",
+                    musicxml=musicxml,
+                    midi_filename=f"{output_stem}.mid",
+                    midi_base64=_encode_bytes(synthetic_midi),
+                    pdf_filename=(
+                        f"{output_stem}-A4.pdf" if engraving.pdf_bytes else None
+                    ),
+                    pdf_base64=_encode_bytes(engraving.pdf_bytes),
+                    preview_png_base64=_encode_bytes(engraving.preview_png),
+                    analysis=analysis,
+                    warnings=warnings,
+                )
+                semantic_rebuilt = True
+        else:
+            response.warnings.append(
+                "OMR 结构异常，但没有提取到可重建的音符，已保留清理后的识别结果"
             )
-            musicxml, analysis, warnings, engraving = await _engrave_with_safe_fallback(
-                synthetic_midi, f"{stem}.mid", musicxml, analysis, warnings, conversion_options
-            )
-            analysis["engraving"] = engraving.analysis
-            warnings.extend(engraving.warnings)
-            warnings.append(
-                "OMR 原始输出存在无法雕版的破损小节，已按识别出的音符经语义流水线重新制谱"
-            )
-            response = ConversionResponse(
-                filename=f"{stem}.musicxml",
-                musicxml=musicxml,
-                midi_filename=f"{stem}.mid",
-                midi_base64=_encode_bytes(synthetic_midi),
-                pdf_filename=f"{stem}-A4.pdf" if engraving.pdf_bytes else None,
-                pdf_base64=_encode_bytes(engraving.pdf_bytes),
-                preview_png_base64=_encode_bytes(engraving.preview_png),
-                analysis=analysis,
-                warnings=warnings,
-            )
-    response.warnings = list(dict.fromkeys([*omr.warnings, *response.warnings]))
-    response.analysis["omr"] = omr.analysis
+    omr_analysis["semantic_rebuilt"] = semantic_rebuilt
+    response.warnings = list(
+        dict.fromkeys([*omr.warnings, *structure_warnings, *response.warnings])
+    )
+    response.analysis["omr"] = omr_analysis
     response.analysis["source"] = {
         **response.analysis.get("source", {}),
         "format": "pdf",
@@ -372,6 +424,102 @@ def _decode_score_upload(data: bytes, filename: str) -> str:
     return text
 
 
+def _apply_score_metadata(
+    musicxml: str,
+    *,
+    title: str | None,
+    author: str | None,
+) -> str:
+    if title is None and author is None:
+        return musicxml
+
+    root = ET.fromstring(musicxml)
+    if title is not None:
+        work = root.find("./work")
+        if work is None:
+            work = ET.Element("work")
+            _insert_root_metadata(root, work, before={
+                "movement-number",
+                "movement-title",
+                "identification",
+                "defaults",
+                "credit",
+                "part-list",
+                "part",
+                "measure",
+            })
+        work_title = work.find("./work-title")
+        if work_title is None:
+            work_title = ET.SubElement(work, "work-title")
+        work_title.text = title
+        _set_score_credit(root, "title", title)
+
+    if author is not None:
+        identification = root.find("./identification")
+        if identification is None:
+            identification = ET.Element("identification")
+            _insert_root_metadata(
+                root,
+                identification,
+                before={"defaults", "credit", "part-list", "part", "measure"},
+            )
+        creators = identification.findall("./creator[@type='composer']")
+        if creators:
+            creators[0].text = author
+            for duplicate in creators[1:]:
+                identification.remove(duplicate)
+        else:
+            creator = ET.Element("creator", type="composer")
+            creator.text = author
+            identification.insert(0, creator)
+        _set_score_credit(root, "composer", author)
+
+    ET.indent(root, space="  ")
+    score_kind = "Partwise" if root.tag == "score-partwise" else "Timewise"
+    dtd_name = "partwise" if root.tag == "score-partwise" else "timewise"
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
+        f'<!DOCTYPE {root.tag} PUBLIC "-//Recordare//DTD MusicXML 4.0 {score_kind}//EN" '
+        f'"http://www.musicxml.org/dtds/{dtd_name}.dtd">\n'
+        + ET.tostring(root, encoding="unicode", short_empty_elements=True)
+    )
+
+
+def _insert_root_metadata(
+    root: ET.Element,
+    element: ET.Element,
+    *,
+    before: set[str],
+) -> None:
+    for index, child in enumerate(root):
+        if child.tag in before:
+            root.insert(index, element)
+            return
+    root.append(element)
+
+
+def _set_score_credit(root: ET.Element, credit_type: str, value: str) -> None:
+    for credit in root.findall("./credit"):
+        if credit.findtext("./credit-type") == credit_type:
+            words = credit.find("./credit-words")
+            if words is None:
+                words = ET.SubElement(credit, "credit-words")
+            words.text = value
+            return
+
+    credit = ET.Element("credit", page="1")
+    ET.SubElement(credit, "credit-type").text = credit_type
+    attributes = {
+        "default-x": "600" if credit_type == "title" else "1120",
+        "default-y": "1600" if credit_type == "title" else "1550",
+        "justify": "center" if credit_type == "title" else "right",
+        "valign": "top",
+        "font-size": "22" if credit_type == "title" else "11",
+    }
+    ET.SubElement(credit, "credit-words", attributes).text = value
+    _insert_root_metadata(root, credit, before={"part-list", "part", "measure"})
+
+
 def _score_upload_analysis(
     musicxml: str,
     filename: str,
@@ -383,9 +531,11 @@ def _score_upload_analysis(
         or root.findtext("./movement-title")
         or Path(filename).stem
     )
+    author = root.findtext("./identification/creator[@type='composer']")
     measures = root.findall(".//measure")
     return {
         "title": title.strip() or Path(filename).stem,
+        "author": author.strip() if author and author.strip() else None,
         "note_count": sum(
             note.find("pitch") is not None for note in root.findall(".//note")
         ),
@@ -464,7 +614,8 @@ async def convert_media(
     analysis["transcription"] = transcription.analysis
     analysis["engraving"] = engraving.analysis
     warnings = [*transcription.warnings, *warnings, *engraving.warnings]
-    stem = Path(filename).stem or "recording"
+    stem = _safe_output_stem(filename, conversion_options.output_filename, "recording")
+    analysis["output_filename"] = stem
     return ConversionResponse(
         filename=f"{stem}.musicxml",
         musicxml=musicxml,
@@ -493,10 +644,16 @@ async def demo(conversion_options: ConversionOptions) -> ConversionResponse:
     )
     analysis["engraving"] = engraving.analysis
     warnings.extend(engraving.warnings)
+    stem = _safe_output_stem(
+        "demo-piano.mid",
+        conversion_options.output_filename,
+        "demo-piano",
+    )
+    analysis["output_filename"] = stem
     return ConversionResponse(
-        filename="demo-piano.musicxml",
+        filename=f"{stem}.musicxml",
         musicxml=musicxml,
-        pdf_filename="demo-piano-A4.pdf" if engraving.pdf_bytes else None,
+        pdf_filename=f"{stem}-A4.pdf" if engraving.pdf_bytes else None,
         pdf_base64=_encode_bytes(engraving.pdf_bytes),
         preview_png_base64=_encode_bytes(engraving.preview_png),
         analysis=analysis,
@@ -508,6 +665,25 @@ def _encode_bytes(value: bytes | None) -> str | None:
     if value is None:
         return None
     return base64.b64encode(value).decode("ascii")
+
+
+def _safe_output_stem(
+    source_filename: str,
+    requested: str | None,
+    fallback: str,
+) -> str:
+    candidate = requested or Path(source_filename).stem or fallback
+    candidate = re.split(r"[/\\]", candidate)[-1].strip()
+    candidate = re.sub(
+        r"\.(?:mid|midi|musicxml|xml|mxl|pdf|wav|mp3|flac|m4a|aac|ogg|opus|mp4|mkv|mov|webm)$",
+        "",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", candidate)
+    candidate = re.sub(r"\s+", " ", candidate).strip(" .")
+    candidate = candidate[:100].rstrip(" .")
+    return candidate or fallback
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]

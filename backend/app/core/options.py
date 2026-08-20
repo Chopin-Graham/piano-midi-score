@@ -21,7 +21,17 @@ class ConversionOptions(BaseModel):
     time_numerator: int | None = Field(default=None, ge=1, le=12)
     time_denominator: Literal[2, 4, 8, 16] | None = None
     title: str | None = Field(default=None, max_length=120)
+    author: str | None = Field(default=None, max_length=120)
+    output_filename: str | None = Field(default=None, max_length=120)
     audio_transcription: bool = False
+
+    @field_validator("title", "author", "output_filename", mode="before")
+    @classmethod
+    def normalize_optional_text(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
 
     @field_validator("hand_split")
     @classmethod
