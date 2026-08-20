@@ -39,11 +39,58 @@ def _write_beats(audio_path: Path, output_path: Path) -> None:
         trim=False,
     )
     tempo_value = float(np.asarray(tempo).reshape(-1)[0])
+    stable_beats = [float(value) for value in beat_times]
+    # A global tempo prior is intentionally retained as the stable incumbent.
+    # A second tracker may follow genuine accelerando/rubato, but it is only a
+    # candidate: the main process compares it with piano-transcription attacks
+    # and applies a tempo-continuity prior before it may affect the score.
+    adaptive_beats: list[float] = []
+    try:
+        local_tempo = np.asarray(
+            librosa.feature.tempo(
+                onset_envelope=onset_envelope,
+                sr=sample_rate,
+                aggregate=None,
+            )
+        ).reshape(-1)
+        local_tempo = np.nan_to_num(
+            local_tempo,
+            nan=tempo_value,
+            posinf=240.0,
+            neginf=40.0,
+        )
+        local_tempo = np.clip(local_tempo, 40.0, 240.0)
+        _, adaptive_beat_times = librosa.beat.beat_track(
+            onset_envelope=onset_envelope,
+            sr=sample_rate,
+            bpm=local_tempo,
+            units="time",
+            trim=False,
+        )
+        adaptive_beats = [float(value) for value in adaptive_beat_times]
+    except (FloatingPointError, TypeError, ValueError):
+        # The stable tracker remains a complete fallback when a sparse or
+        # pathological onset envelope cannot support a local tempo curve.
+        pass
+    beat_candidates = [
+        {
+            "method": "librosa_dynamic_beat_warp",
+            "beat_times": stable_beats,
+        }
+    ]
+    if len(adaptive_beats) >= 4:
+        beat_candidates.append(
+            {
+                "method": "librosa_adaptive_tempo_warp",
+                "beat_times": adaptive_beats,
+            }
+        )
     output_path.write_text(
         json.dumps(
             {
                 "tempo_bpm": tempo_value,
-                "beat_times": [float(value) for value in beat_times],
+                "beat_times": stable_beats,
+                "beat_candidates": beat_candidates,
                 "sample_rate": sample_rate,
             },
             ensure_ascii=False,

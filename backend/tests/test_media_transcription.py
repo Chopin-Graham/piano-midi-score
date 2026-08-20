@@ -8,6 +8,7 @@ from app.core.media_transcription import (
     _align_attack_columns,
     _attack_column_window,
     _beat_mapper,
+    _BeatCandidate,
     _clean_notes,
     _estimate_meter_and_downbeat,
     _postprocess_midi,
@@ -97,6 +98,47 @@ def test_attack_columns_are_capped_and_preserve_note_durations() -> None:
     }
 
 
+def test_attack_columns_keep_fast_stepwise_run_in_sequence() -> None:
+    notes = [
+        _TimedNote(
+            60 + index,
+            index * 0.031,
+            index * 0.031 + 0.052,
+            82,
+        )
+        for index in range(7)
+    ]
+
+    aligned, analysis = _align_attack_columns(notes, 0.040)
+
+    assert [round(note.start, 3) for note in aligned] == [
+        0.0,
+        0.031,
+        0.062,
+        0.093,
+        0.124,
+        0.155,
+        0.186,
+    ]
+    assert analysis["aligned_attack_notes"] == 0
+    assert analysis["attack_columns_after"] == 7
+
+
+def test_attack_columns_still_align_isolated_short_interval_dyad() -> None:
+    notes = [
+        _TimedNote(48, 0.0, 0.4, 72),
+        _TimedNote(60, 1.0, 1.5, 84),
+        _TimedNote(64, 1.018, 1.49, 81),
+        _TimedNote(72, 2.0, 2.3, 70),
+    ]
+
+    aligned, analysis = _align_attack_columns(notes, 0.040)
+
+    dyad = [note for note in aligned if note.pitch in {60, 64}]
+    assert {note.start for note in dyad} == {1.0}
+    assert analysis["aligned_attack_notes"] == 1
+
+
 def test_tempo_selector_rejects_a_misleading_fast_beat_layer() -> None:
     notes = [
         _TimedNote(60 + index % 5, index * 0.125, index * 0.125 + 0.1, 80)
@@ -144,6 +186,83 @@ def test_tempo_selector_accepts_a_confident_dynamic_beat_grid() -> None:
         candidate for candidate in analysis["tempo_candidates"] if candidate["selected"]
     )
     assert selected["grid_hit_rate"] > 0.9
+
+
+def test_tempo_selector_prefers_continuous_adaptive_accelerando() -> None:
+    adaptive_beats = [0.0]
+    period = 0.68
+    for _ in range(18):
+        adaptive_beats.append(adaptive_beats[-1] + period)
+        period *= 0.965
+    notes: list[_TimedNote] = []
+    for index, (left, right) in enumerate(
+        zip(adaptive_beats, adaptive_beats[1:], strict=False)
+    ):
+        midpoint = (left + right) / 2
+        notes.extend(
+            [
+                _TimedNote(48 + index % 4, left, left + 0.12, 78),
+                _TimedNote(64 + index % 5, midpoint, midpoint + 0.1, 82),
+            ]
+        )
+    stable_beats = [index * 0.5 for index in range(24)]
+
+    mapper, _, method, analysis = _select_timeline_mapper(
+        stable_beats,
+        notes,
+        source_tempo=120.0,
+        beat_candidates=[
+            _BeatCandidate(
+                "librosa_adaptive_tempo_warp",
+                tuple(adaptive_beats),
+            )
+        ],
+    )
+
+    assert method == "librosa_adaptive_tempo_warp"
+    assert abs(mapper(adaptive_beats[12]) - 12.0) < 1e-9
+    selected = next(
+        candidate for candidate in analysis["tempo_candidates"] if candidate["selected"]
+    )
+    assert selected["tempo_continuity_penalty"] < 0.002
+
+
+def test_tempo_selector_rejects_jittery_adaptive_layer_switch() -> None:
+    stable_beats = [index * 0.5 for index in range(24)]
+    jittery_beats = [0.0]
+    for index in range(23):
+        jittery_beats.append(jittery_beats[-1] + (0.4 if index % 2 == 0 else 0.6))
+    notes: list[_TimedNote] = []
+    for index, (left, right) in enumerate(
+        zip(jittery_beats, jittery_beats[1:], strict=False)
+    ):
+        midpoint = (left + right) / 2
+        notes.extend(
+            [
+                _TimedNote(48 + index % 4, left, left + 0.12, 78),
+                _TimedNote(64 + index % 5, midpoint, midpoint + 0.1, 82),
+            ]
+        )
+
+    _, _, method, analysis = _select_timeline_mapper(
+        stable_beats,
+        notes,
+        source_tempo=120.0,
+        beat_candidates=[
+            _BeatCandidate(
+                "librosa_adaptive_tempo_warp",
+                tuple(jittery_beats),
+            )
+        ],
+    )
+
+    assert method != "librosa_adaptive_tempo_warp"
+    adaptive = next(
+        candidate
+        for candidate in analysis["tempo_candidates"]
+        if candidate["method"] == "librosa_adaptive_tempo_warp"
+    )
+    assert adaptive["tempo_continuity_penalty"] == 0.02
 
 
 def test_postprocess_outputs_aligned_piano_midi() -> None:
@@ -313,7 +432,9 @@ def test_attack_column_window_preserves_fast_thirty_seconds() -> None:
     for index in range(16):
         onset = index * seconds_per_beat / 8
         notes.append(_TimedNote(60 + index % 5, onset, onset + 0.04, 80))
-    # A genuine chord with 20 ms jitter on the third 32nd.
+    # A neighbouring semitone arrives 20 ms after the third 32nd.  Inside a
+    # continuous scalar run this is another melodic attack, not a dyad whose
+    # onset should be manufactured by alignment.
     notes.append(_TimedNote(64, 3 * seconds_per_beat / 8 + 0.02, 3 * seconds_per_beat / 8 + 0.06, 76))
     window = _attack_column_window(notes, 120.0)
     assert 0.025 <= window <= 0.045
@@ -321,7 +442,7 @@ def test_attack_column_window_preserves_fast_thirty_seconds() -> None:
     aligned, analysis = _align_attack_columns(notes, window)
 
     assert analysis["attack_columns_after"] >= 16
-    assert analysis["attack_columns_after"] < analysis["attack_columns_before"]
+    assert analysis["attack_columns_after"] == analysis["attack_columns_before"]
 
 
 def test_tempo_selector_does_not_treat_note_density_as_tempo() -> None:

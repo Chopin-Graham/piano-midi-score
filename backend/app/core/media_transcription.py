@@ -68,6 +68,12 @@ class _TimedPedal:
     down: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _BeatCandidate:
+    method: str
+    beat_times: tuple[float, ...]
+
+
 def transcribe_media(
     data: bytes,
     filename: str,
@@ -114,9 +120,14 @@ def transcribe_media(
 
         beat_times: list[float] = []
         beat_tempo: float | None = None
+        beat_candidates: list[_BeatCandidate] = []
         if options.align_beats:
             try:
-                beat_times, beat_tempo = _estimate_beats(audio_python, audio_path, workdir)
+                beat_times, beat_tempo, beat_candidates = _estimate_beats(
+                    audio_python,
+                    audio_path,
+                    workdir,
+                )
             except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
                 warnings.append(
                     f"Beat alignment was unavailable ({exc}); retained a constant-tempo MIDI timeline"
@@ -127,6 +138,7 @@ def transcribe_media(
             beat_times,
             options.minimum_note_ms,
             backend,
+            beat_candidates=beat_candidates,
         )
         warnings.extend(postprocess_warnings)
 
@@ -139,9 +151,9 @@ def transcribe_media(
         "source_bytes": len(data),
         "duration_seconds": round(duration_seconds, 3),
         "beat_detection": bool(beat_times),
-        "beat_alignment": postprocess["alignment_method"]
-        == "librosa_dynamic_beat_warp",
+        "beat_alignment": str(postprocess["alignment_method"]).startswith("librosa_"),
         "beat_count": len(beat_times),
+        "beat_candidate_count": (1 + len(beat_candidates)) if beat_times else 0,
         "detected_beat_tempo_bpm": (
             round(beat_tempo, 3) if beat_tempo is not None else None
         ),
@@ -391,7 +403,7 @@ def _estimate_beats(
     audio_python: Path,
     audio_path: Path,
     workdir: Path,
-) -> tuple[list[float], float | None]:
+) -> tuple[list[float], float | None, list[_BeatCandidate]]:
     output = workdir / "beats.json"
     worker = PROJECT_ROOT / "backend/app/audio_worker.py"
     completed = subprocess.run(
@@ -411,7 +423,32 @@ def _estimate_beats(
     beats = sorted({float(value) for value in payload.get("beat_times", []) if value >= 0})
     if len(beats) < 4:
         raise ValueError("fewer than four reliable beats were detected")
-    return beats, float(payload.get("tempo_bpm", 0.0)) or None
+    alternatives: list[_BeatCandidate] = []
+    primary = tuple(beats)
+    for item in payload.get("beat_candidates", []):
+        if not isinstance(item, dict):
+            continue
+        method = str(item.get("method", "")).strip()
+        candidate = tuple(
+            sorted(
+                {
+                    float(value)
+                    for value in item.get("beat_times", [])
+                    if float(value) >= 0
+                }
+            )
+        )
+        if (
+            not method
+            or not method.startswith("librosa_")
+            or not method.endswith("_warp")
+            or method == "librosa_dynamic_beat_warp"
+            or len(candidate) < 4
+            or candidate == primary
+        ):
+            continue
+        alternatives.append(_BeatCandidate(method, candidate))
+    return beats, float(payload.get("tempo_bpm", 0.0)) or None, alternatives
 
 
 def _postprocess_midi(
@@ -419,6 +456,8 @@ def _postprocess_midi(
     beat_times: list[float],
     minimum_note_ms: float,
     backend: str,
+    *,
+    beat_candidates: list[_BeatCandidate] | None = None,
 ) -> tuple[bytes, dict[str, object], list[str]]:
     notes, pedals, source_tempo = _timed_events(raw_midi_bytes)
     cleaned, cleaning = _clean_notes(notes, minimum_note_ms / 1000)
@@ -433,6 +472,7 @@ def _postprocess_midi(
         beat_times,
         aligned,
         source_tempo,
+        beat_candidates=beat_candidates,
     )
     meter_numerator, meter_denominator, downbeat_phase = _estimate_meter_and_downbeat(
         aligned, mapper
@@ -479,7 +519,7 @@ def _postprocess_midi(
         warnings.append(
             f"The transcription is unusually dense ({note_density:.1f} notes/s); review for false positives"
         )
-    if beat_times and alignment_method != "librosa_dynamic_beat_warp":
+    if beat_times and not alignment_method.startswith("librosa_"):
         warnings.append(
             "The detected beat grid did not improve the transcription attack alignment; "
             f"used a stable {tempo_bpm:.1f} BPM timeline instead"
@@ -680,12 +720,15 @@ def _align_attack_columns(
         }
 
     ordered = sorted(notes, key=lambda note: (note.start, note.pitch, note.end))
+    melodic_attack_starts = _fast_melodic_attack_starts(
+        ordered,
+        window_seconds,
+    )
     before = len({round(note.start, 6) for note in ordered})
     aligned: list[_TimedNote] = []
     shifted = 0
     duplicates = 0
     index = 0
-    columns = 0
     while index < len(ordered):
         anchor = ordered[index].start
         stop = index + 1
@@ -695,48 +738,116 @@ def _align_attack_columns(
         ):
             stop += 1
 
-        by_pitch: dict[int, _TimedNote] = {}
+        cluster = ordered[index:stop]
+        cluster_starts = {note.start for note in cluster}
+        preserve_melody = (
+            len(cluster_starts & melodic_attack_starts) >= 2
+        )
+        by_attack: dict[tuple[float, int], _TimedNote] = {}
         for note in ordered[index:stop]:
             duration = note.end - note.start
-            if note.start != anchor:
+            target_start = note.start if preserve_melody else anchor
+            if target_start != note.start:
                 shifted += 1
             moved = _TimedNote(
                 pitch=note.pitch,
-                start=anchor,
-                end=anchor + duration,
+                start=target_start,
+                end=target_start + duration,
                 velocity=note.velocity,
             )
-            previous = by_pitch.get(note.pitch)
+            key = (target_start, note.pitch)
+            previous = by_attack.get(key)
             if previous is None:
-                by_pitch[note.pitch] = moved
+                by_attack[key] = moved
             else:
-                by_pitch[note.pitch] = _TimedNote(
+                by_attack[key] = _TimedNote(
                     pitch=note.pitch,
-                    start=anchor,
+                    start=target_start,
                     end=max(previous.end, moved.end),
                     velocity=max(previous.velocity, moved.velocity),
                 )
                 duplicates += 1
-        aligned.extend(by_pitch.values())
-        columns += 1
+        aligned.extend(by_attack.values())
         index = stop
 
+    aligned = sorted(aligned, key=lambda note: (note.start, note.pitch, note.end))
     return (
-        sorted(aligned, key=lambda note: (note.start, note.pitch, note.end)),
+        aligned,
         {
             "attack_window_ms": round(window_seconds * 1000, 3),
             "attack_columns_before": before,
-            "attack_columns_after": columns,
+            "attack_columns_after": len(
+                {round(note.start, 6) for note in aligned}
+            ),
             "aligned_attack_notes": shifted,
             "merged_duplicate_attacks": duplicates,
         },
     )
 
 
+def _fast_melodic_attack_starts(
+    notes: list[_TimedNote],
+    window_seconds: float,
+) -> set[float]:
+    """Find attacks that belong to a rapid single-line figure.
+
+    A four-note run supplies musical context that a two-note onset cluster
+    cannot: successive close pitches continuing for longer than the chord
+    jitter window are a melody, even when two neighbouring detections happen
+    to fall inside that window.  Keeping their raw order here prevents the
+    later quantizer from treating the manufactured simultaneity as a true
+    dyad.  Very compact rolled chords remain eligible for alignment because
+    their whole gesture fits inside the jitter window.
+    """
+
+    columns: dict[float, set[int]] = {}
+    for note in notes:
+        columns.setdefault(note.start, set()).add(note.pitch)
+    ordered = sorted(columns.items())
+    if len(ordered) < 4:
+        return set()
+
+    minimum_gap = max(0.008, window_seconds * 0.18)
+    rapid_gap = max(0.075, window_seconds * 2.4)
+    minimum_span = window_seconds * 1.35
+    protected: set[float] = set()
+    for index in range(len(ordered) - 3):
+        run = ordered[index : index + 4]
+        gaps = [
+            right[0] - left[0]
+            for left, right in zip(run, run[1:], strict=False)
+        ]
+        if (
+            any(gap < minimum_gap or gap > rapid_gap for gap in gaps)
+            or run[-1][0] - run[0][0] < minimum_span
+            or not _has_close_pitch_path(run)
+        ):
+            continue
+        protected.update(start for start, _ in run)
+    return protected
+
+
+def _has_close_pitch_path(
+    columns: list[tuple[float, set[int]]],
+) -> bool:
+    reachable = set(columns[0][1])
+    for _, pitches in columns[1:]:
+        reachable = {
+            pitch
+            for pitch in pitches
+            if any(1 <= abs(pitch - previous) <= 5 for previous in reachable)
+        }
+        if not reachable:
+            return False
+    return True
+
+
 def _select_timeline_mapper(
     beat_times: list[float],
     notes: list[_TimedNote],
     source_tempo: float,
+    *,
+    beat_candidates: list[_BeatCandidate] | None = None,
 ) -> tuple[Callable[[float], float], float, str, dict[str, object]]:
     """Choose the beat layer whose rhythmic grid best matches note attacks.
 
@@ -749,7 +860,15 @@ def _select_timeline_mapper(
     source_tempo = max(40.0, min(220.0, source_tempo))
     attack_times = sorted({round(note.start, 6) for note in notes})
 
-    candidates: list[tuple[str, float, Callable[[float], float], bool]] = []
+    candidates: list[
+        tuple[
+            str,
+            float,
+            Callable[[float], float],
+            bool,
+            tuple[float, float, float, float],
+        ]
+    ] = []
     constant_tempos: list[tuple[str, float]] = [
         ("constant_tempo_source", source_tempo),
         ("constant_tempo_notes", _estimate_note_tempo(notes, source_tempo)),
@@ -757,13 +876,38 @@ def _select_timeline_mapper(
     if len(beat_times) >= 2:
         dynamic_mapper, beat_tempo = _beat_mapper(beat_times, notes)
         candidates.append(
-            ("librosa_dynamic_beat_warp", beat_tempo, dynamic_mapper, True)
+            (
+                "librosa_dynamic_beat_warp",
+                beat_tempo,
+                dynamic_mapper,
+                True,
+                _beat_continuity_analysis(beat_times),
+            )
         )
         constant_tempos.append(("constant_tempo_beats", beat_tempo))
         if beat_tempo / 2 >= 40:
             constant_tempos.append(("constant_tempo_beats_half", beat_tempo / 2))
         if beat_tempo * 2 <= 220:
             constant_tempos.append(("constant_tempo_beats_double", beat_tempo * 2))
+
+    known_methods = {candidate[0] for candidate in candidates}
+    for beat_candidate in beat_candidates or []:
+        if beat_candidate.method in known_methods or len(beat_candidate.beat_times) < 2:
+            continue
+        adaptive_mapper, adaptive_tempo = _beat_mapper(
+            list(beat_candidate.beat_times),
+            notes,
+        )
+        candidates.append(
+            (
+                beat_candidate.method,
+                adaptive_tempo,
+                adaptive_mapper,
+                True,
+                _beat_continuity_analysis(list(beat_candidate.beat_times)),
+            )
+        )
+        known_methods.add(beat_candidate.method)
 
     seen_tempos: list[float] = []
     for method, tempo in constant_tempos:
@@ -777,12 +921,13 @@ def _select_timeline_mapper(
                 tempo,
                 lambda seconds, current=tempo: seconds * current / 60,
                 False,
+                (0.0, 0.0, 0.0, 0.0),
             )
         )
 
     scored: list[dict[str, object]] = []
     selected_mappers: dict[str, Callable[[float], float]] = {}
-    for method, tempo, base_mapper, dynamic in candidates:
+    for method, tempo, base_mapper, dynamic, continuity in candidates:
         phase, grid_name, grid_error, hit_rate, rhythm_score = _best_rhythm_phase(
             base_mapper,
             attack_times,
@@ -807,7 +952,8 @@ def _select_timeline_mapper(
         # their output MIDI.  It is useful as a weak tie-breaker, but must not
         # overrule a clearly better audio-derived beat grid.
         source_prior = abs(log2(tempo / source_tempo)) * 0.006
-        dynamic_penalty = 0.003 if dynamic else 0.0
+        continuity_penalty, jump_rate, reversal_rate, severe_jump_rate = continuity
+        dynamic_penalty = (0.003 + continuity_penalty) if dynamic else 0.0
         total_score = rhythm_score + density_penalty + source_prior + dynamic_penalty
         selected_mappers[method] = mapper
         scored.append(
@@ -819,6 +965,10 @@ def _select_timeline_mapper(
                 "grid_error": round(grid_error, 5),
                 "grid_hit_rate": round(hit_rate, 4),
                 "attack_columns_per_quarter": round(columns_per_quarter, 4),
+                "tempo_jump_rate": round(jump_rate, 4),
+                "tempo_reversal_rate": round(reversal_rate, 4),
+                "tempo_severe_jump_rate": round(severe_jump_rate, 4),
+                "tempo_continuity_penalty": round(continuity_penalty, 6),
                 "score": round(total_score, 6),
             }
         )
@@ -851,6 +1001,57 @@ def _select_timeline_mapper(
             "tempo_candidates": sorted(scored, key=lambda item: float(item["score"])),
         },
     )
+
+
+def _beat_continuity_analysis(
+    beat_times: list[float],
+) -> tuple[float, float, float, float]:
+    """Penalize beat-layer switches while preserving smooth tempo curves.
+
+    Genuine accelerando and rubato change neighboring beat periods gradually.
+    Audio trackers instead tend to jump between tactus levels (for example
+    quarter, dotted-quarter, or half-note pulses) and often reverse that jump
+    a beat later.  This compact state-continuity prior mirrors the role of a
+    transition model in DBN beat tracking: it never rejects a candidate by
+    itself, but a jittery curve must improve the transcription grid by enough
+    to pay for its implausible tempo motion.
+    """
+
+    periods = [
+        right - left
+        for left, right in zip(beat_times, beat_times[1:], strict=False)
+        if right > left
+    ]
+    if len(periods) < 3:
+        return 0.0, 0.0, 0.0, 0.0
+
+    changes = [
+        log2(current / previous)
+        for previous, current in zip(periods, periods[1:], strict=False)
+    ]
+    jump_threshold = log2(1.12)
+    reversal_threshold = log2(1.06)
+    severe_threshold = log2(1.25)
+    jump_rate = sum(abs(change) >= jump_threshold for change in changes) / len(changes)
+    severe_jump_rate = (
+        sum(abs(change) >= severe_threshold for change in changes) / len(changes)
+    )
+    reversal_pairs = list(zip(changes, changes[1:], strict=False))
+    reversal_rate = (
+        sum(
+            left * right < 0
+            and min(abs(left), abs(right)) >= reversal_threshold
+            for left, right in reversal_pairs
+        )
+        / len(reversal_pairs)
+        if reversal_pairs
+        else 0.0
+    )
+    penalty = min(
+        0.02,
+        0.03 * jump_rate + 0.02 * reversal_rate + 0.04 * severe_jump_rate,
+    )
+    return penalty, jump_rate, reversal_rate, severe_jump_rate
 
 
 def _best_rhythm_phase(

@@ -351,3 +351,127 @@ def test_audio_true_32nd_run_keeps_fine_grid() -> None:
 
     assert len({note.onset for note in quantized}) == 64
     assert any(decision.step <= 60 for decision in decisions)
+
+
+def test_audio_fast_run_does_not_become_short_interval_dyad() -> None:
+    notes = [
+        RawNote(index, pitch, onset, onset + 48, 82, 0, 0)
+        for index, (pitch, onset) in enumerate(
+            [(60, 0), (62, 50), (64, 170), (65, 290)]
+        )
+    ]
+
+    quantized, decisions, _, _ = quantize_midi(
+        _audio_parsed(notes),
+        Meter(4, 4),
+        ConversionOptions(
+            style="clean",
+            audio_transcription=True,
+            allow_triplets=False,
+        ),
+    )
+
+    run = sorted(quantized, key=lambda note: note.source_id)
+    assert len({note.onset for note in run}) == 4
+    assert run[0].onset != run[1].onset
+    assert decisions[0].step <= 60
+
+
+def test_audio_seven_note_flourish_uses_fine_binary_grid() -> None:
+    onsets = [round(index * 480 / 7) for index in range(7)]
+    notes = [
+        RawNote(index, 72 + index, onset, onset + 52, 84, 0, 0)
+        for index, onset in enumerate(onsets)
+    ]
+
+    quantized, decisions, _, _ = quantize_midi(
+        _audio_parsed(notes),
+        Meter(4, 4),
+        ConversionOptions(
+            style="clean",
+            audio_transcription=True,
+            allow_triplets=False,
+        ),
+    )
+
+    run = sorted(quantized, key=lambda note: note.source_id)
+    assert len({note.onset for note in run}) == 7
+    assert decisions[0].triplet is False
+    assert decisions[0].step == 30
+
+
+def test_audio_nine_note_flourish_keeps_every_attack_separate() -> None:
+    onsets = [round(index * 480 / 9) for index in range(9)]
+    notes = [
+        RawNote(index, 67 + index, onset, onset + 44, 84, 0, 0)
+        for index, onset in enumerate(onsets)
+    ]
+
+    quantized, decisions, _, _ = quantize_midi(
+        _audio_parsed(notes),
+        Meter(4, 4),
+        ConversionOptions(
+            style="clean",
+            audio_transcription=True,
+            allow_triplets=False,
+        ),
+    )
+
+    run = sorted(quantized, key=lambda note: note.source_id)
+    assert len(run) == 9
+    assert len({note.onset for note in run}) == 9
+    assert all(
+        not (
+            left.onset == right.onset
+            and 1 <= abs(left.pitch - right.pitch) <= 5
+        )
+        for index, left in enumerate(run)
+        for right in run[index + 1 :]
+    )
+    assert decisions[0].triplet is False
+    assert decisions[0].step == 30
+
+
+def test_audio_dense_run_jointly_snaps_attacks_closer_than_half_a_64th() -> None:
+    onsets = [36, 155, 231, 286, 300, 397]
+    notes = [
+        RawNote(index, 60 + index, onset, onset + 52, 84, 0, 0)
+        for index, onset in enumerate(onsets)
+    ]
+
+    quantized, _, _, _ = quantize_midi(
+        _audio_parsed(notes),
+        Meter(4, 4),
+        ConversionOptions(
+            style="clean",
+            audio_transcription=True,
+            allow_triplets=False,
+        ),
+    )
+
+    run = sorted(quantized, key=lambda note: note.source_id)
+    assert len({note.onset for note in run}) == len(onsets)
+    assert [note.onset for note in run] == sorted(note.onset for note in run)
+
+
+def test_audio_ordered_snap_keeps_true_same_onset_dyad_together() -> None:
+    notes = [
+        RawNote(index, pitch, onset, onset + 52, 84, 0, 0)
+        for index, (pitch, onset) in enumerate(
+            [(60, 36), (62, 155), (64, 286), (67, 286), (69, 300), (71, 397)]
+        )
+    ]
+
+    quantized, _, _, _ = quantize_midi(
+        _audio_parsed(notes),
+        Meter(4, 4),
+        ConversionOptions(
+            style="clean",
+            audio_transcription=True,
+            allow_triplets=False,
+        ),
+    )
+
+    by_id = {note.source_id: note for note in quantized}
+    assert by_id[2].onset == by_id[3].onset
+    assert by_id[3].onset < by_id[4].onset

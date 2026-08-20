@@ -199,6 +199,21 @@ def quantize_midi(
                 for grid in candidates
                 if _fine_grid_has_attack_evidence(bucket_notes, grid, options)
             ] or candidates
+            high_order_flourish = (
+                options.audio_transcription
+                and len({note.onset for note in bucket_notes}) >= 7
+            )
+            if high_order_flourish:
+                # Septuplets and denser flourishes cannot be represented
+                # exactly at 480 divisions without inventing an unsupported
+                # ratio.  Keep them on a fine binary grid instead: this
+                # preserves every attack in order and avoids fake short-
+                # interval dyads manufactured by a coarser tuplet grid.
+                binary_candidates = [
+                    grid for grid in bucket_candidates if not grid.triplet
+                ]
+                if binary_candidates:
+                    bucket_candidates = binary_candidates
             best = min(
                 bucket_candidates,
                 key=lambda grid: _grid_cost(
@@ -312,6 +327,21 @@ def quantize_midi(
                         < 2
                     ):
                         best = best_binary
+            if high_order_flourish:
+                best = _high_order_flourish_grid(
+                    bucket_notes,
+                    bucket_start,
+                    bucket_candidates,
+                )
+            elif options.audio_transcription:
+                best = _avoid_fast_run_short_interval_merges(
+                    bucket_notes,
+                    bucket_start,
+                    candidates,
+                    best,
+                    options.style,
+                    onsets_only=True,
+                )
             bucket_grids[bucket_key] = best
 
         finest = min(
@@ -339,10 +369,19 @@ def quantize_midi(
         for (beat_index, _lane), bucket_notes in buckets.items():
             grid = bucket_grids[(beat_index, _lane)]
             bucket_start = measure.start + measure.meter.beat_group_boundaries[beat_index]
+            bucket_end = (
+                measure.start
+                + measure.meter.beat_group_boundaries[beat_index + 1]
+            )
+            snapped_attacks = _ordered_attack_snap_map(
+                bucket_notes,
+                bucket_start,
+                bucket_end,
+                grid,
+                options,
+            )
             for note in bucket_notes:
-                snapped_onset = bucket_start + _nearest_multiple(
-                    note.onset - bucket_start, grid.step
-                )
+                snapped_onset = snapped_attacks[note.onset]
                 if measure_index == len(measures) - 1 and snapped_onset >= measure.end:
                     snapped_onset = max(measure.start, measure.end - grid.step)
                 snapped_end = bucket_start + _nearest_multiple(
@@ -455,6 +494,13 @@ def _fine_grid_has_attack_evidence(
         return True
 
     onsets = sorted({note.onset for note in notes})
+    if len(onsets) >= 7:
+        # Seven or more attacks inside one beat are direct evidence of a
+        # high-order flourish.  Their 50--80 tick spacing is not "rapid"
+        # enough for the old 64th-grid test, yet a 32nd grid may merge two
+        # adjacent scale tones.  Let the grid selector compare the fine binary
+        # candidates instead of rejecting them up front.
+        return True
     required_onsets = 4 if grid.step <= CANONICAL_DIVISIONS // 16 else 3
     if len(onsets) < required_onsets:
         return False
@@ -538,6 +584,244 @@ def _false_chord_merges(
         raw_onsets = {raw_onset for _, raw_onset in members}
         if len(pitches) > 1 and len(raw_onsets) > 1:
             merges += sum(1 for _, raw_onset in members if raw_onset != min(raw_onsets))
+    return merges
+
+
+def _high_order_flourish_grid(
+    notes: list[QuantizedNote],
+    bucket_start: int,
+    candidates: list[GridSpec],
+) -> GridSpec:
+    """Approximate seven-plus-note flourishes without losing attack order.
+
+    First maximize the number of distinct attack columns.  Among grids that
+    preserve the same number, accept the coarsest one whose onset fit is within
+    a small tolerance of the best fit.  Exact written 32nds therefore remain
+    32nds, while true seven-/nine-note flourishes earn a 64th grid when it
+    materially improves their spacing or prevents a collision.
+    """
+
+    scored = [
+        (
+            grid,
+            _snapped_attack_column_count(notes, bucket_start, grid.step),
+            _grid_timing_error(
+                notes,
+                bucket_start,
+                grid.step,
+                onsets_only=True,
+            ),
+        )
+        for grid in candidates
+        if not grid.triplet
+    ]
+    if not scored:
+        return min(candidates, key=lambda grid: grid.step)
+
+    most_columns = max(column_count for _, column_count, _ in scored)
+    faithful = [item for item in scored if item[1] == most_columns]
+    best_error = min(error for _, _, error in faithful)
+    near_best = [
+        grid
+        for grid, _, error in faithful
+        if error <= best_error + 0.03
+    ]
+    return max(near_best, key=lambda grid: grid.step)
+
+
+def _avoid_fast_run_short_interval_merges(
+    notes: list[QuantizedNote],
+    bucket_start: int,
+    candidates: list[GridSpec],
+    selected: GridSpec,
+    style: str,
+    *,
+    onsets_only: bool,
+) -> GridSpec:
+    """Reject a grid that turns a rapid melodic interval into a chord."""
+
+    selected_merges = _false_short_interval_merges(
+        notes,
+        bucket_start,
+        selected.step,
+    )
+    if not selected_merges:
+        return selected
+
+    selected_columns = _snapped_attack_column_count(
+        notes,
+        bucket_start,
+        selected.step,
+    )
+    finer_binary = [
+        (
+            grid,
+            _false_short_interval_merges(
+                notes,
+                bucket_start,
+                grid.step,
+            ),
+            _snapped_attack_column_count(notes, bucket_start, grid.step),
+        )
+        for grid in candidates
+        if not grid.triplet and grid.step < selected.step
+    ]
+    if not finer_binary:
+        return selected
+    fewest_merges = min(merges for _, merges, _ in finer_binary)
+    most_columns = max(
+        columns
+        for _, merges, columns in finer_binary
+        if merges == fewest_merges
+    )
+    if (
+        fewest_merges > selected_merges
+        or (
+            fewest_merges == selected_merges
+            and most_columns <= selected_columns
+        )
+    ):
+        return selected
+    safer_binary = [
+        grid
+        for grid, merges, columns in finer_binary
+        if merges == fewest_merges and columns == most_columns
+    ]
+    return min(
+        safer_binary,
+        key=lambda grid: _grid_cost(
+            notes,
+            bucket_start,
+            grid,
+            style,
+            fidelity_first=len(notes) <= 3,
+            onsets_only=onsets_only,
+        ),
+    )
+
+
+def _ordered_attack_snap_map(
+    notes: list[QuantizedNote],
+    bucket_start: int,
+    bucket_end: int,
+    grid: GridSpec,
+    options: ConversionOptions,
+) -> dict[int, int]:
+    """Jointly snap a rapid line so distinct attacks stay in time order.
+
+    Independent rounding can map two nearby scale tones to the same 64th-note
+    cell.  Once a rapid short-interval collision is detected, solve the small
+    ordered assignment problem for the whole beat: every raw attack column
+    receives a strictly later grid point, while notes that truly shared a raw
+    onset remain a chord on one point.
+    """
+
+    raw_onsets = sorted({note.onset for note in notes})
+    default = {
+        onset: bucket_start
+        + _nearest_multiple(onset - bucket_start, grid.step)
+        for onset in raw_onsets
+    }
+    if (
+        not options.audio_transcription
+        or not _false_short_interval_merges(
+            notes,
+            bucket_start,
+            grid.step,
+        )
+    ):
+        return default
+
+    points = list(range(bucket_start, bucket_end + 1, grid.step))
+    if len(raw_onsets) > len(points):
+        return default
+
+    infinity = float("inf")
+    previous_costs = [abs(point - raw_onsets[0]) for point in points]
+    parents: list[list[int]] = [[-1] * len(points)]
+    for onset_index in range(1, len(raw_onsets)):
+        current_costs = [infinity] * len(points)
+        current_parents = [-1] * len(points)
+        best_previous_cost = infinity
+        best_previous_index = -1
+        for point_index, point in enumerate(points):
+            previous_index = point_index - 1
+            if (
+                previous_index >= 0
+                and previous_costs[previous_index] < best_previous_cost
+            ):
+                best_previous_cost = previous_costs[previous_index]
+                best_previous_index = previous_index
+            if best_previous_index >= 0:
+                current_costs[point_index] = (
+                    best_previous_cost + abs(point - raw_onsets[onset_index])
+                )
+                current_parents[point_index] = best_previous_index
+        previous_costs = current_costs
+        parents.append(current_parents)
+
+    final_index = min(
+        range(len(points)),
+        key=lambda index: previous_costs[index],
+    )
+    if previous_costs[final_index] == infinity:
+        return default
+
+    assigned = [0] * len(raw_onsets)
+    for onset_index in range(len(raw_onsets) - 1, -1, -1):
+        assigned[onset_index] = points[final_index]
+        if onset_index:
+            final_index = parents[onset_index][final_index]
+    return dict(zip(raw_onsets, assigned, strict=True))
+
+
+def _snapped_attack_column_count(
+    notes: list[QuantizedNote],
+    bucket_start: int,
+    step: int,
+) -> int:
+    return len(
+        {
+            bucket_start + _nearest_multiple(note.onset - bucket_start, step)
+            for note in notes
+        }
+    )
+
+
+def _false_short_interval_merges(
+    notes: list[QuantizedNote],
+    bucket_start: int,
+    step: int,
+) -> int:
+    """Count rapid stepwise attacks a grid would stack as a false dyad."""
+
+    raw_onsets = sorted({note.onset for note in notes})
+    if len(raw_onsets) < 4:
+        return 0
+    rapid_gaps = sum(
+        right - left <= CANONICAL_DIVISIONS // 4
+        for left, right in pairwise(raw_onsets)
+    )
+    if rapid_gaps < 2:
+        return 0
+
+    by_cell: dict[int, list[QuantizedNote]] = defaultdict(list)
+    for note in notes:
+        snapped = bucket_start + _nearest_multiple(
+            note.onset - bucket_start,
+            step,
+        )
+        by_cell[snapped].append(note)
+
+    merges = 0
+    for members in by_cell.values():
+        for index, left in enumerate(members):
+            for right in members[index + 1 :]:
+                if (
+                    left.onset != right.onset
+                    and 1 <= abs(left.pitch - right.pitch) <= 5
+                ):
+                    merges += 1
     return merges
 
 
