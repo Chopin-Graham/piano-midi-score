@@ -39,6 +39,7 @@ export interface ConversionResponse {
   pdf_filename: string | null;
   pdf_base64: string | null;
   preview_png_base64: string | null;
+  preview_pngs_base64?: string[];
   analysis: {
     title: string;
     author?: string | null;

@@ -583,6 +583,7 @@ export default function App() {
           <ScorePreview
             musicxml={result?.musicxml ?? null}
             previewPngBase64={result?.preview_png_base64 ?? null}
+            previewPngsBase64={result?.preview_pngs_base64 ?? null}
             pageCount={result?.analysis.engraving?.page_count ?? 1}
           />
         </section>

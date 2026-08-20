@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .core.options import ConversionOptions, TranscriptionOptions
 
@@ -34,5 +34,6 @@ class ConversionResponse(BaseModel):
     pdf_filename: str | None = None
     pdf_base64: str | None = None
     preview_png_base64: str | None = None
+    preview_pngs_base64: list[str] = Field(default_factory=list)
     analysis: dict[str, Any]
     warnings: list[str]

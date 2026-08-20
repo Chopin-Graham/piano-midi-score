@@ -134,6 +134,9 @@ button:disabled { cursor: not-allowed; opacity: 0.48; }
 .publication-stage { padding: 22px 24px 34px; background: #dedbd4; overflow: auto; }
 .publication-meta { width: min(100%, 900px); margin: 0 auto 12px; display: flex; align-items: baseline; justify-content: space-between; gap: 16px; color: #5e5a53; font-size: 11px; }
 .publication-meta strong { color: var(--accent); font-size: 12px; }
+.score-page-list { display: grid; gap: 24px; }
+.score-page { width: min(100%, 900px); margin: 0 auto; }
+.score-page figcaption { margin: 0 0 7px; color: #6f6a62; text-align: right; font-size: 10px; }
 .score-page-image { display: block; width: min(100%, 900px); height: auto; margin: 0 auto; background: white; box-shadow: 0 10px 32px rgba(43, 39, 32, .18); }
 .preview-note { margin: 13px 0 0; color: #6f6a62; text-align: center; font-size: 11px; }
 .rendering-badge { position: sticky; left: 50%; top: 12px; z-index: 2; width: max-content; margin: 0 auto -28px; padding: 7px 11px; border-radius: 999px; color: white; background: #2f5547dd; font-size: 11px; }

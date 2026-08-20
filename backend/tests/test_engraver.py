@@ -1,9 +1,12 @@
 from xml.etree import ElementTree as ET
 
+from pypdf import PdfWriter
+
 from app.core.engraver import (
     _layout_balance_score,
     _low_density_singleton_measures,
     _needs_page_rebalance,
+    _read_render_outputs,
     _with_rebalanced_singletons,
 )
 
@@ -78,3 +81,30 @@ def test_rebalances_when_final_page_is_denser_than_penultimate() -> None:
 
     assert _needs_page_rebalance(initial)
     assert _layout_balance_score(balanced) < _layout_balance_score(initial)
+
+
+def test_read_render_outputs_keeps_every_preview_page_in_numeric_order(
+    tmp_path,
+) -> None:
+    pdf_path = tmp_path / "score.pdf"
+    writer = PdfWriter()
+    for _ in range(3):
+        writer.add_blank_page(width=595, height=842)
+    with pdf_path.open("wb") as stream:
+        writer.write(stream)
+
+    (tmp_path / "preview-10.png").write_bytes(b"page-10")
+    (tmp_path / "preview-2.png").write_bytes(b"page-2")
+    (tmp_path / "preview-1.png").write_bytes(b"page-1")
+
+    _, first_preview, previews, preview_count, layout = _read_render_outputs(
+        tmp_path,
+        pdf_path,
+        tmp_path / "score.mpos",
+        tmp_path / "preview.png",
+    )
+
+    assert first_preview == b"page-1"
+    assert previews == (b"page-1", b"page-2", b"page-10")
+    assert preview_count == 3
+    assert layout["page_count"] == 3

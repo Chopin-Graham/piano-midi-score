@@ -54,6 +54,14 @@ def test_convert_endpoint() -> None:
         assert base64.b64decode(payload["pdf_base64"]).startswith(b"%PDF")
         assert payload["analysis"]["engraving"]["a4"] is True
         assert payload["analysis"]["engraving"]["style"] == "modern"
+    if payload["preview_png_base64"]:
+        preview_pages = payload["preview_pngs_base64"]
+        assert len(preview_pages) == payload["analysis"]["engraving"]["page_count"]
+        assert preview_pages[0] == payload["preview_png_base64"]
+        assert all(
+            base64.b64decode(page).startswith(b"\x89PNG")
+            for page in preview_pages
+        )
 
 
 def test_convert_endpoint_applies_custom_metadata_and_output_filename() -> None:

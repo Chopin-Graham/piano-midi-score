@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 interface ScorePreviewProps {
   musicxml: string | null;
   previewPngBase64?: string | null;
+  previewPngsBase64?: string[] | null;
   pageCount?: number;
 }
 
@@ -20,16 +21,28 @@ type OsmdConstructor = new (
   options?: Record<string, unknown>,
 ) => OsmdInstance;
 
-export function ScorePreview({ musicxml, previewPngBase64, pageCount = 1 }: ScorePreviewProps) {
+export function ScorePreview({
+  musicxml,
+  previewPngBase64,
+  previewPngsBase64,
+  pageCount = 1,
+}: ScorePreviewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [renderError, setRenderError] = useState<string | null>(null);
   const [rendering, setRendering] = useState(false);
+  const previewPages = previewPngsBase64?.length
+    ? previewPngsBase64
+    : previewPngBase64
+      ? [previewPngBase64]
+      : [];
+  const hasPublicationPreview = previewPages.length > 0;
+  const totalPages = Math.max(pageCount, previewPages.length);
 
   useEffect(() => {
     let cancelled = false;
     const target = containerRef.current;
     const xml = musicxml;
-    if (!target || !xml || previewPngBase64) return;
+    if (!target || !xml || hasPublicationPreview) return;
 
     async function renderScore(container: HTMLDivElement, scoreXml: string) {
       setRendering(true);
@@ -72,7 +85,7 @@ export function ScorePreview({ musicxml, previewPngBase64, pageCount = 1 }: Scor
       cancelled = true;
       target.innerHTML = "";
     };
-  }, [musicxml, previewPngBase64]);
+  }, [musicxml, hasPublicationPreview]);
 
   if (!musicxml) {
     return (
@@ -90,19 +103,32 @@ export function ScorePreview({ musicxml, previewPngBase64, pageCount = 1 }: Scor
     );
   }
 
-  if (previewPngBase64) {
+  if (hasPublicationPreview) {
     return (
       <div className="score-stage publication-stage">
         <div className="publication-meta">
           <strong>A4 出版级预览</strong>
-          <span>第 1 页 / 共 {pageCount} 页 · MuseScore Studio 雕版</span>
+          <span>共 {totalPages} 页 · 已显示全部页面 · MuseScore Studio 雕版</span>
         </div>
-        <img
-          className="score-page-image"
-          src={`data:image/png;base64,${previewPngBase64}`}
-          alt="A4 钢琴谱第一页预览"
-        />
-        {pageCount > 1 && <p className="preview-note">此处显示第一页，下载 A4 PDF 可查看全部页面。</p>}
+        <div className="score-page-list">
+          {previewPages.map((preview, index) => (
+            <figure className="score-page" key={`${index}-${preview.slice(0, 24)}`}>
+              <figcaption>第 {index + 1} 页 / 共 {totalPages} 页</figcaption>
+              <img
+                className="score-page-image"
+                src={`data:image/png;base64,${preview}`}
+                alt={`A4 钢琴谱第 ${index + 1} 页预览`}
+                loading={index === 0 ? "eager" : "lazy"}
+                decoding="async"
+              />
+            </figure>
+          ))}
+        </div>
+        {previewPages.length < totalPages && (
+          <p className="preview-note">
+            当前服务仅返回了 {previewPages.length} 页预览；下载 A4 PDF 可查看全部 {totalPages} 页。
+          </p>
+        )}
       </div>
     );
   }

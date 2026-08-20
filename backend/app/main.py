@@ -146,6 +146,7 @@ async def convert(
         pdf_filename=f"{stem}-A4.pdf" if engraving.pdf_bytes else None,
         pdf_base64=_encode_bytes(engraving.pdf_bytes),
         preview_png_base64=_encode_bytes(engraving.preview_png),
+        preview_pngs_base64=_encode_byte_items(engraving.preview_pngs),
         analysis=analysis,
         warnings=list(dict.fromkeys(warnings)),
     )
@@ -259,6 +260,7 @@ async def _convert_score_upload(
         pdf_filename=f"{stem}-A4.pdf" if engraving.pdf_bytes else None,
         pdf_base64=_encode_bytes(engraving.pdf_bytes),
         preview_png_base64=_encode_bytes(engraving.preview_png),
+        preview_pngs_base64=_encode_byte_items(engraving.preview_pngs),
         analysis=analysis,
         warnings=list(dict.fromkeys(warnings)),
     )
@@ -367,6 +369,7 @@ async def _convert_score_pdf_upload(
                     ),
                     pdf_base64=_encode_bytes(engraving.pdf_bytes),
                     preview_png_base64=_encode_bytes(engraving.preview_png),
+                    preview_pngs_base64=_encode_byte_items(engraving.preview_pngs),
                     analysis=analysis,
                     warnings=warnings,
                 )
@@ -624,6 +627,7 @@ async def convert_media(
         pdf_filename=f"{stem}-A4.pdf" if engraving.pdf_bytes else None,
         pdf_base64=_encode_bytes(engraving.pdf_bytes),
         preview_png_base64=_encode_bytes(engraving.preview_png),
+        preview_pngs_base64=_encode_byte_items(engraving.preview_pngs),
         analysis=analysis,
         warnings=list(dict.fromkeys(warnings)),
     )
@@ -656,6 +660,7 @@ async def demo(conversion_options: ConversionOptions) -> ConversionResponse:
         pdf_filename=f"{stem}-A4.pdf" if engraving.pdf_bytes else None,
         pdf_base64=_encode_bytes(engraving.pdf_bytes),
         preview_png_base64=_encode_bytes(engraving.preview_png),
+        preview_pngs_base64=_encode_byte_items(engraving.preview_pngs),
         analysis=analysis,
         warnings=list(dict.fromkeys(warnings)),
     )
@@ -665,6 +670,10 @@ def _encode_bytes(value: bytes | None) -> str | None:
     if value is None:
         return None
     return base64.b64encode(value).decode("ascii")
+
+
+def _encode_byte_items(values: tuple[bytes, ...]) -> list[str]:
+    return [base64.b64encode(value).decode("ascii") for value in values]
 
 
 def _safe_output_stem(

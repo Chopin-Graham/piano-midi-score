@@ -31,6 +31,7 @@ LOW_DENSITY_SINGLETON_MAX_PITCHED_NOTES = 20
 class EngravingResult:
     pdf_bytes: bytes | None
     preview_png: bytes | None
+    preview_pngs: tuple[bytes, ...]
     analysis: dict[str, object]
     warnings: list[str]
 
@@ -46,6 +47,7 @@ def render_a4_musicxml(
         return EngravingResult(
             pdf_bytes=None,
             preview_png=None,
+            preview_pngs=(),
             analysis={
                 "available": False,
                 "engine": "MusicXML only",
@@ -82,7 +84,13 @@ def render_a4_musicxml(
                 command.extend(["-S", str(style_path)])
             command.extend(["-j", str(job_path)])
             _run_musescore(command)
-            pdf_bytes, preview_png, preview_count, layout = _read_render_outputs(
+            (
+                pdf_bytes,
+                preview_png,
+                preview_pngs,
+                preview_count,
+                layout,
+            ) = _read_render_outputs(
                 temp_dir,
                 pdf_path,
                 mpos_path,
@@ -109,6 +117,7 @@ def render_a4_musicxml(
                         (
                             candidate_pdf,
                             candidate_preview,
+                            candidate_previews,
                             candidate_count,
                             candidate_layout,
                         ) = candidate
@@ -125,6 +134,7 @@ def render_a4_musicxml(
                         ):
                             pdf_bytes = candidate_pdf
                             preview_png = candidate_preview
+                            preview_pngs = candidate_previews
                             preview_count = candidate_count
                             layout = candidate_layout
                             accepted_xml = singleton_xml
@@ -152,13 +162,20 @@ def render_a4_musicxml(
                             mpos_path,
                             png_path,
                         )
-                        candidate_pdf, candidate_preview, candidate_count, candidate_layout = candidate
+                        (
+                            candidate_pdf,
+                            candidate_preview,
+                            candidate_previews,
+                            candidate_count,
+                            candidate_layout,
+                        ) = candidate
                         layout_passes += 1
                         if int(candidate_layout.get("page_count", 0)) <= int(
                             layout.get("page_count", 0)
                         ) and _layout_balance_score(candidate_layout) < _layout_balance_score(layout):
                             pdf_bytes = candidate_pdf
                             preview_png = candidate_preview
+                            preview_pngs = candidate_previews
                             preview_count = candidate_count
                             layout = candidate_layout
                             accepted_xml = balanced_xml
@@ -181,11 +198,18 @@ def render_a4_musicxml(
                 }
             )
             warnings = _layout_warnings(layout)
-            return EngravingResult(pdf_bytes, preview_png, layout, warnings)
+            return EngravingResult(
+                pdf_bytes,
+                preview_png,
+                preview_pngs,
+                layout,
+                warnings,
+            )
     except subprocess.TimeoutExpired:
         return EngravingResult(
             pdf_bytes=None,
             preview_png=None,
+            preview_pngs=(),
             analysis={
                 "available": False,
                 "engine": "MuseScore Studio 4",
@@ -198,6 +222,7 @@ def render_a4_musicxml(
         return EngravingResult(
             pdf_bytes=None,
             preview_png=None,
+            preview_pngs=(),
             analysis={
                 "available": False,
                 "engine": "MuseScore Studio 4",
@@ -259,19 +284,28 @@ def _read_render_outputs(
     pdf_path: Path,
     mpos_path: Path,
     png_path: Path,
-) -> tuple[bytes, bytes | None, int, dict[str, object]]:
+) -> tuple[bytes, bytes | None, tuple[bytes, ...], int, dict[str, object]]:
     if not pdf_path.is_file():
         raise RuntimeError("MuseScore 未生成 PDF 文件")
     pdf_bytes = pdf_path.read_bytes()
     if not pdf_bytes.startswith(b"%PDF"):
         raise RuntimeError("MuseScore 输出不是有效 PDF")
-    preview_paths = sorted(temp_dir.glob("preview-*.png"))
+    preview_paths = sorted(
+        temp_dir.glob("preview-*.png"),
+        key=_preview_page_sort_key,
+    )
     if not preview_paths and png_path.is_file():
         preview_paths = [png_path]
-    preview_png = preview_paths[0].read_bytes() if preview_paths else None
+    preview_pngs = tuple(path.read_bytes() for path in preview_paths)
+    preview_png = preview_pngs[0] if preview_pngs else None
     layout = _pdf_layout(pdf_bytes)
     layout.update(_measure_layout(mpos_path))
-    return pdf_bytes, preview_png, len(preview_paths), layout
+    return pdf_bytes, preview_png, preview_pngs, len(preview_pngs), layout
+
+
+def _preview_page_sort_key(path: Path) -> tuple[int, str]:
+    suffix = path.stem.rsplit("-", 1)[-1]
+    return (int(suffix), path.name) if suffix.isdigit() else (0, path.name)
 
 
 def _clear_render_outputs(
